@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
+import NavIcon from "@/components/base/NavIcon.vue";
 import type { ThemePreference } from "@/types/domain";
 
 export type ViewKey = "space" | "moves" | "links" | "settings" | "help";
+type NavIconName = "space" | "moves" | "links" | "settings" | "help";
 
 defineProps<{
   activeView: ViewKey;
@@ -17,12 +19,12 @@ defineEmits<{
   "update:theme": [theme: ThemePreference];
 }>();
 
-const navigation: Array<{ key: ViewKey; label: string; icon: string }> = [
-  { key: "space", label: "空间分析", icon: "▦" },
-  { key: "moves", label: "迁移记录", icon: "↔" },
-  { key: "links", label: "链接检测", icon: "⌁" },
-  { key: "settings", label: "设置", icon: "⚙" },
-  { key: "help", label: "帮助", icon: "?" },
+const navigation: Array<{ key: ViewKey; label: string; icon: NavIconName }> = [
+  { key: "space", label: "空间分析", icon: "space" },
+  { key: "moves", label: "迁移记录", icon: "moves" },
+  { key: "links", label: "链接检测", icon: "links" },
+  { key: "settings", label: "设置", icon: "settings" },
+  { key: "help", label: "帮助", icon: "help" },
 ];
 
 const sidebarStorageKey = "dirmover.sidebar.collapsed";
@@ -37,7 +39,21 @@ watch(collapsed, (value) => {
   <div class="app-layout" :class="{ collapsed }">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">D</div>
+        <button
+          class="brand-logo"
+          type="button"
+          :disabled="!collapsed"
+          :title="collapsed ? '展开菜单' : undefined"
+          :aria-label="collapsed ? '展开菜单' : 'DirMover'"
+          @click="collapsed = false"
+        >
+          <span class="brand-mark" aria-hidden="true">D</span>
+          <span class="expand-chevron" aria-hidden="true">
+            <svg viewBox="0 0 10 16" fill="none">
+              <path d="m3 3 5 5-5 5" />
+            </svg>
+          </span>
+        </button>
         <div class="brand-copy">
           <strong>DirMover</strong>
         </div>
@@ -64,7 +80,9 @@ watch(collapsed, (value) => {
           :aria-current="activeView === item.key ? 'page' : undefined"
           @click="$emit('navigate', item.key)"
         >
-          <span class="nav-icon" aria-hidden="true">{{ item.icon }}</span>
+          <span class="nav-icon" aria-hidden="true">
+            <NavIcon :name="item.icon" />
+          </span>
           <strong class="nav-label">{{ item.label }}</strong>
         </button>
       </nav>
@@ -109,26 +127,31 @@ watch(collapsed, (value) => {
 
 <style scoped>
 .app-layout {
-  display: grid;
-  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  display: flex;
   width: 100vw;
   height: 100vh;
+  overflow: hidden;
   color: var(--text-primary);
   background: var(--surface-app);
-  transition: grid-template-columns var(--duration-normal) var(--ease-standard);
-}
-
-.app-layout.collapsed {
-  grid-template-columns: 88px minmax(0, 1fr);
 }
 
 .sidebar {
   display: grid;
+  width: var(--sidebar-width);
+  flex: 0 0 auto;
   grid-template-rows: auto 1fr auto;
   min-width: 0;
+  overflow: hidden;
   padding: var(--space-3);
   border-right: 1px solid var(--border-subtle);
   background: var(--surface-sidebar);
+  contain: layout paint;
+  transition: width var(--duration-normal) var(--ease-standard);
+  will-change: width;
+}
+
+.collapsed .sidebar {
+  width: 72px;
 }
 
 .brand {
@@ -137,11 +160,40 @@ watch(collapsed, (value) => {
   gap: var(--space-3);
   height: 64px;
   padding-inline: var(--space-2);
+  white-space: nowrap;
 }
 
 .collapsed .brand {
-  gap: var(--space-1);
+  gap: 0;
   padding-inline: 0;
+}
+
+.brand-logo {
+  position: relative;
+  display: flex;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  align-items: center;
+  padding: 0;
+  overflow: visible;
+  color: inherit;
+  background: transparent;
+}
+
+.brand-logo:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.collapsed .brand-logo {
+  width: 48px;
+  flex-basis: 48px;
+  cursor: pointer;
+}
+
+.collapsed .brand-logo .brand-mark {
+  margin-left: 8px;
 }
 
 .brand-mark {
@@ -160,6 +212,12 @@ watch(collapsed, (value) => {
   display: grid;
   min-width: 0;
   flex: 1;
+  overflow: hidden;
+  opacity: 1;
+  transform: translateX(0);
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    transform var(--duration-normal) var(--ease-standard);
 }
 
 .brand strong {
@@ -167,10 +225,45 @@ watch(collapsed, (value) => {
   font-weight: 650;
 }
 
-.collapsed .brand-copy,
 .collapsed .theme-control,
 .collapsed .engine-state {
   display: none;
+}
+
+.collapsed .brand-copy {
+  flex: 0 0 0;
+  opacity: 0;
+  transform: translateX(-6px);
+}
+
+.expand-chevron {
+  position: absolute;
+  left: 39px;
+  display: grid;
+  width: 9px;
+  height: 16px;
+  place-items: center;
+  color: var(--text-secondary);
+  opacity: 0;
+  transform: translateX(-4px);
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    transform var(--duration-fast) var(--ease-standard);
+}
+
+.expand-chevron svg {
+  width: 9px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.collapsed .brand-logo:hover .expand-chevron,
+.collapsed .brand-logo:focus-visible .expand-chevron {
+  opacity: 1;
+  transform: translateX(0);
 }
 
 nav {
@@ -181,20 +274,29 @@ nav {
 }
 
 nav button {
-  display: flex;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
   min-height: 42px;
   align-items: center;
   gap: var(--space-3);
+  overflow: hidden;
   padding: 7px var(--space-3);
   border-left: 3px solid transparent;
   border-radius: var(--radius-small);
   color: var(--text-secondary);
   background: transparent;
   text-align: left;
+  white-space: nowrap;
+  transition:
+    padding var(--duration-normal) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
 }
 
 .collapsed nav button {
+  grid-template-columns: 20px 0;
   justify-content: center;
+  gap: 0;
   padding: 7px 0;
 }
 
@@ -218,12 +320,27 @@ nav strong {
   width: 20px;
   flex: 0 0 20px;
   place-items: center;
-  font-size: 17px;
-  font-weight: 600;
+  color: var(--text-secondary);
+  transition: color var(--duration-fast) var(--ease-standard);
+}
+
+nav button.active .nav-icon {
+  color: var(--accent);
+}
+
+.nav-label {
+  min-width: 0;
+  overflow: hidden;
+  opacity: 1;
+  transform: translateX(0);
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    transform var(--duration-normal) var(--ease-standard);
 }
 
 .collapsed .nav-label {
-  display: none;
+  opacity: 0;
+  transform: translateX(-5px);
 }
 
 .sidebar-footer {
@@ -266,6 +383,15 @@ select {
   border-radius: var(--radius-small);
   color: var(--text-secondary);
   background: transparent;
+  opacity: 1;
+  transform: scale(1);
+  transition:
+    width var(--duration-normal) var(--ease-standard),
+    flex-basis var(--duration-normal) var(--ease-standard),
+    padding var(--duration-normal) var(--ease-standard),
+    opacity var(--duration-fast) var(--ease-standard),
+    transform var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard);
 }
 
 .collapse-toggle:hover {
@@ -279,6 +405,16 @@ select {
   height: 1.5px;
   border-radius: 1px;
   background: currentColor;
+}
+
+.collapsed .collapse-toggle {
+  visibility: hidden;
+  width: 0;
+  flex-basis: 0;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.75);
 }
 
 .collapsed .sidebar-footer {
@@ -301,9 +437,22 @@ select {
 
 .workspace {
   display: grid;
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) var(--status-height);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .brand-copy,
+  .expand-chevron,
+  nav button,
+  .nav-icon,
+  .nav-label,
+  .collapse-toggle {
+    transition: none;
+  }
 }
 
 main {

@@ -277,19 +277,19 @@ th button {
 }
 
 .folder-column-width {
-  width: 48%;
+  width: auto;
 }
 
 .usage-column-width {
-  width: 18%;
+  width: 10ch;
 }
 
 .count-column-width {
-  width: 15%;
+  width: 14%;
 }
 
 .status-column-width {
-  width: 19%;
+  width: 18%;
 }
 
 .sort-indicator {
@@ -317,6 +317,11 @@ td {
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+th:not(:last-child),
+td:not(:last-child) {
+  border-right: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
 }
 
 tbody tr {

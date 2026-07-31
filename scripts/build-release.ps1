@@ -1,0 +1,44 @@
+param(
+    [switch]$SkipBuild
+)
+
+$ErrorActionPreference = "Stop"
+
+$repositoryRoot = Split-Path -Parent $PSScriptRoot
+$packageManifest = Get-Content -Raw (Join-Path $repositoryRoot "package.json") | ConvertFrom-Json
+$version = $packageManifest.version
+$buildRoot = Join-Path $repositoryRoot "artifacts\build-$version"
+$releaseRoot = Join-Path $repositoryRoot "artifacts\releases\$version"
+
+if (-not $SkipBuild) {
+    $env:CARGO_TARGET_DIR = $buildRoot
+    Push-Location $repositoryRoot
+    try {
+        & npm.cmd run tauri -- build
+        if ($LASTEXITCODE -ne 0) {
+            throw "Tauri build failed with exit code $LASTEXITCODE."
+        }
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+$installers = @(
+    Join-Path $buildRoot "release\bundle\nsis\DirMover_${version}_x64-setup.exe"
+    Join-Path $buildRoot "release\bundle\msi\DirMover_${version}_x64_zh-CN.msi"
+)
+
+foreach ($installer in $installers) {
+    if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+        throw "Installer not found: $installer"
+    }
+}
+
+New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
+foreach ($installer in $installers) {
+    Copy-Item -LiteralPath $installer -Destination $releaseRoot -Force
+}
+
+Write-Host "Installers are ready in: $releaseRoot"
+Get-ChildItem -LiteralPath $releaseRoot -File | Select-Object Name, Length

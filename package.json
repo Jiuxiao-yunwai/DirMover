@@ -8,6 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
+    "package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1",
     "tauri": "tauri",
     "test": "vitest run"
   },

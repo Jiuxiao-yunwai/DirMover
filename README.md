@@ -1,6 +1,26 @@
 # DirMover
 
-DirMover 是一个轻量的 Windows 目录空间分析与安全迁移工具。2.0 版本已完全迁移到 **Tauri 2 + Rust + Vue 3 + TypeScript**：Rust 负责 NTFS 扫描、文件迁移、目录联接和本地记录，Vue 负责响应式桌面界面。
+DirMover 是一个轻量、高性能的 Windows 目录空间分析与安全迁移工具，基于 **Tauri 2 + Rust + Vue 3 + TypeScript** 构建。Rust 负责 NTFS 扫描、文件迁移、目录联接和本地记录，Vue 负责响应式桌面界面。
+
+## 下载与安装
+
+前往 [Releases](https://github.com/Jiuxiao-yunwai/DirMover/releases/latest) 下载最新版本。当前仅提供 Windows x64 版本，建议使用 Windows 10 或 Windows 11。
+
+同一版本提供两种安装包，应用功能完全相同，请选择其中一种安装，不要同时安装：
+
+| 安装包 | 默认安装位置 | 权限 | 适用场景 |
+| --- | --- | --- | --- |
+| `DirMover_*_x64-setup.exe` | `%LOCALAPPDATA%\DirMover` | 无需管理员权限 | 推荐普通用户使用 |
+| `DirMover_*_x64_zh-CN.msi` | `C:\Program Files\DirMover` | 需要管理员权限 | 企业部署、组策略或标准 MSI 管理 |
+
+安装步骤：
+
+1. 从 Releases 下载所需安装包。
+2. 退出正在运行的旧版 DirMover。
+3. 双击安装包并按照中文向导完成安装。
+4. 后续升级建议继续使用同一种安装包；如果需要在 EXE 与 MSI 之间切换，请先卸载原版本。
+
+安装器会在系统缺少 Microsoft Edge WebView2 Runtime 时联网下载安装。Windows 10 和 Windows 11 通常已自带该组件。
 
 ## 功能
 
@@ -25,8 +45,6 @@ DirMover 是一个轻量的 Windows 目录空间分析与安全迁移工具。2.
 - 迁移使用明确的准备、复制、校验、切换、联接、清理阶段。提交点之后会优先恢复可用的源路径。
 - 不把管理员权限写入应用清单；仅在用户发起 MFT 扫描时按需重启提权。
 
-迁移正在运行的应用、带驱动/反作弊/系统服务的软件前，应先退出相关进程。第三方程序是否支持目录联接仍取决于其自身实现。
-
 ## 数据兼容
 
 数据继续保存在隐藏目录 `%USERPROFILE%\.dirmover`：
@@ -37,7 +55,11 @@ DirMover 是一个轻量的 Windows 目录空间分析与安全迁移工具。2.
 
 Rust 存储层保留旧版 PascalCase JSON 结构；前端 IPC 使用独立的 camelCase DTO，因此已有记录可直接读取，界面模型也保持类型一致。写入采用临时文件、刷新落盘和原子替换。
 
-## 开发
+## 使用提醒
+
+迁移目录前请退出正在使用该目录的应用，并确认重要数据已有备份。不要迁移驱动程序、反作弊组件、系统服务或明确不支持目录联接的软件。第三方程序是否支持目录联接取决于其自身实现。
+
+## 本地开发
 
 需要 Node.js 20+、Rust 1.85+、Microsoft C++ Build Tools 与 WebView2。
 
@@ -57,13 +79,12 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-## 发布
+## 构建发布包
 
 ```powershell
-npm run tauri -- build
+npm run package
 ```
 
-构建完成后，可执行文件位于 `src-tauri\target\release\dirmover.exe`，安装包位于 `src-tauri\target\release\bundle\`。
-Windows 的 NSIS 与 MSI 安装界面固定使用简体中文。
+构建完成后，NSIS EXE 与 MSI 安装包会统一汇总到 `artifacts\releases\<版本号>\`。Windows 安装界面固定使用简体中文。
 
 更多设计说明见 [架构文档](docs/architecture.md)。

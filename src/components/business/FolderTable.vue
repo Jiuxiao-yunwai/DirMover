@@ -1,15 +1,16 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import BaseContextMenu from "@/components/base/BaseContextMenu.vue";
 import EmptyState from "@/components/base/EmptyState.vue";
 import type { FolderRow, SortDirection, SortField } from "@/types/domain";
 import { formatBytes, formatInteger } from "@/utils/format";
 
-defineProps<{
+const props = defineProps<{
   rows: FolderRow[];
   selectedPath: string | null;
   sortField: SortField;
   sortDirection: SortDirection;
+  totalAllocatedBytes: number;
 }>();
 
 const emit = defineEmits<{
@@ -21,14 +22,21 @@ const emit = defineEmits<{
 
 const menu = ref({ open: false, x: 0, y: 0, row: null as FolderRow | null });
 
-const sortMark = (
-  field: SortField,
-  current: SortField,
-  direction: SortDirection,
-): string => {
-  if (field !== current) return "";
-  return direction === "ascending" ? " ↑" : " ↓";
+const allocatedPercentage = (row: FolderRow): number => {
+  if (!row.measured || props.totalAllocatedBytes <= 0) return 0;
+  return Math.min(100, (row.allocatedBytes / props.totalAllocatedBytes) * 100);
 };
+
+const percentageLabel = (row: FolderRow): string => {
+  const percentage = allocatedPercentage(row);
+  if (percentage <= 0) return "0%";
+  if (percentage < 0.1) return "<0.1%";
+  return `${percentage.toFixed(1)}%`;
+};
+
+const sortClass = computed(() =>
+  props.sortDirection === "ascending" ? "ascending" : "descending",
+);
 
 const showMenu = (event: MouseEvent, row: FolderRow): void => {
   event.preventDefault();
@@ -52,26 +60,89 @@ const invokeMenu = (action: "open" | "copy"): void => {
   <div class="table-shell">
     <div v-if="rows.length > 0" class="table-scroll">
       <table>
+        <colgroup>
+          <col class="folder-column-width" />
+          <col class="usage-column-width" />
+          <col class="count-column-width" />
+          <col class="status-column-width" />
+        </colgroup>
         <thead>
           <tr>
-            <th class="align-left folder-column">
+            <th
+              class="align-left folder-column"
+              :aria-sort="
+                sortField === 'name'
+                  ? sortDirection === 'ascending'
+                    ? 'ascending'
+                    : 'descending'
+                  : 'none'
+              "
+            >
               <button type="button" @click="$emit('sort', 'name')">
-                文件夹{{ sortMark("name", sortField, sortDirection) }}
+                <span>文件夹</span>
+                <span
+                  v-if="sortField === 'name'"
+                  class="sort-indicator"
+                  :class="sortClass"
+                  aria-hidden="true"
+                />
               </button>
             </th>
-            <th>
+            <th
+              :aria-sort="
+                sortField === 'allocatedBytes'
+                  ? sortDirection === 'ascending'
+                    ? 'ascending'
+                    : 'descending'
+                  : 'none'
+              "
+            >
               <button type="button" @click="$emit('sort', 'allocatedBytes')">
-                磁盘占用{{ sortMark("allocatedBytes", sortField, sortDirection) }}
+                <span>磁盘占用</span>
+                <span
+                  v-if="sortField === 'allocatedBytes'"
+                  class="sort-indicator"
+                  :class="sortClass"
+                  aria-hidden="true"
+                />
               </button>
             </th>
-            <th>
+            <th
+              :aria-sort="
+                sortField === 'fileCount'
+                  ? sortDirection === 'ascending'
+                    ? 'ascending'
+                    : 'descending'
+                  : 'none'
+              "
+            >
               <button type="button" @click="$emit('sort', 'fileCount')">
-                文件数{{ sortMark("fileCount", sortField, sortDirection) }}
+                <span>文件数</span>
+                <span
+                  v-if="sortField === 'fileCount'"
+                  class="sort-indicator"
+                  :class="sortClass"
+                  aria-hidden="true"
+                />
               </button>
             </th>
-            <th>
+            <th
+              :aria-sort="
+                sortField === 'status'
+                  ? sortDirection === 'ascending'
+                    ? 'ascending'
+                    : 'descending'
+                  : 'none'
+              "
+            >
               <button type="button" @click="$emit('sort', 'status')">
-                状态{{ sortMark("status", sortField, sortDirection) }}
+                <span>状态</span>
+                <span
+                  v-if="sortField === 'status'"
+                  class="sort-indicator"
+                  :class="sortClass"
+                  aria-hidden="true"
+                />
               </button>
             </th>
           </tr>
@@ -80,6 +151,7 @@ const invokeMenu = (action: "open" | "copy"): void => {
           <tr
             v-for="row in rows"
             :key="row.fullPath"
+            data-app-context-menu
             :class="{ selected: selectedPath === row.fullPath }"
             tabindex="0"
             @click="$emit('select', row)"
@@ -92,7 +164,23 @@ const invokeMenu = (action: "open" | "copy"): void => {
               <span class="row-marker" :class="{ linked: row.isLink }" />
               {{ row.name }}
             </td>
-            <td>{{ row.measured ? formatBytes(row.allocatedBytes) : "未扫描" }}</td>
+            <td
+              class="usage-cell"
+              :title="
+                row.measured
+                  ? `${formatBytes(row.allocatedBytes)}，占当前扫描总量 ${percentageLabel(row)}`
+                  : '未扫描'
+              "
+            >
+              <span
+                v-if="row.measured"
+                class="usage-bar"
+                :style="{ width: `${allocatedPercentage(row)}%` }"
+              />
+              <span class="usage-value">
+                {{ row.measured ? formatBytes(row.allocatedBytes) : "未扫描" }}
+              </span>
+            </td>
             <td>{{ row.measured ? formatInteger(row.fileCount) : "—" }}</td>
             <td :title="row.linkTarget ?? row.note">
               <span
@@ -173,15 +261,50 @@ th {
 }
 
 th button {
+  display: inline-flex;
   width: 100%;
   height: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
   color: inherit;
   background: transparent;
   text-align: inherit;
 }
 
-th:not(.folder-column) {
-  width: 145px;
+.folder-column button {
+  justify-content: flex-start;
+}
+
+.folder-column-width {
+  width: 42%;
+}
+
+.usage-column-width {
+  width: 24%;
+}
+
+.count-column-width {
+  width: 15%;
+}
+
+.status-column-width {
+  width: 19%;
+}
+
+.sort-indicator {
+  width: 0;
+  height: 0;
+  border-right: 4px solid transparent;
+  border-left: 4px solid transparent;
+}
+
+.sort-indicator.ascending {
+  border-bottom: 6px solid currentColor;
+}
+
+.sort-indicator.descending {
+  border-top: 6px solid currentColor;
 }
 
 td {
@@ -220,6 +343,24 @@ tbody tr:focus-visible {
 
 .folder-name {
   color: var(--text-primary);
+}
+
+.usage-cell {
+  position: relative;
+}
+
+.usage-bar {
+  position: absolute;
+  inset: 3px auto 3px 0;
+  min-width: 2px;
+  border-radius: 0 3px 3px 0;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  pointer-events: none;
+}
+
+.usage-value {
+  position: relative;
+  z-index: 1;
 }
 
 .row-marker {

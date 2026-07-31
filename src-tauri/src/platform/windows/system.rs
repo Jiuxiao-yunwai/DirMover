@@ -3,15 +3,23 @@ use crate::{
     models::DriveInfo,
 };
 use std::{
+    fs::OpenOptions,
+    mem::size_of,
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     path::Path,
     process::{Command, Stdio},
 };
 use windows::{
     Win32::{
+        Foundation::HANDLE,
         Storage::FileSystem::{
             FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, GetDiskFreeSpaceExW, GetDriveTypeW,
             GetFileAttributesW, GetVolumeInformationW, MOVEFILE_REPLACE_EXISTING,
             MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileAttributesW,
+        },
+        System::{
+            IO::DeviceIoControl,
+            Ioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER},
         },
         UI::{
             Shell::{IsUserAnAdmin, ShellExecuteW},
@@ -20,6 +28,8 @@ use windows::{
     },
     core::{HSTRING, PCWSTR},
 };
+
+const SHARE_ALL: u32 = 0x0000_0007;
 
 pub fn is_administrator() -> bool {
     // SAFETY: IsUserAnAdmin has no parameters and does not retain state.
@@ -80,6 +90,37 @@ pub fn drive_info(path: &Path) -> AppResult<DriveInfo> {
         fixed,
         ready: true,
     })
+}
+
+pub fn physical_disk_location(path: &Path) -> AppResult<(u32, u32)> {
+    let root = volume_root(path)?;
+    let volume_path = format!(r"\\.\{}", root.trim_end_matches('\\'));
+    let volume = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(SHARE_ALL)
+        .open(volume_path)?;
+    let handle = HANDLE(volume.as_raw_handle());
+    let mut number = STORAGE_DEVICE_NUMBER::default();
+    let mut returned = 0_u32;
+    unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            None,
+            0,
+            Some((&raw mut number).cast()),
+            u32::try_from(size_of::<STORAGE_DEVICE_NUMBER>()).unwrap_or(0),
+            Some(&mut returned),
+            None,
+        )
+        .map_err(windows_error)?;
+    }
+    if returned < u32::try_from(size_of::<STORAGE_DEVICE_NUMBER>()).unwrap_or(u32::MAX) {
+        return Err(AppError::Platform(
+            "Windows 未返回完整的物理磁盘信息。".to_string(),
+        ));
+    }
+    Ok((number.DeviceNumber, number.PartitionNumber))
 }
 
 pub fn mark_hidden(path: &Path) -> AppResult<()> {

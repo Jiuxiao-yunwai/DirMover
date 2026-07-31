@@ -317,15 +317,29 @@ const notifyError = (error: unknown): void => {
         </option>
         <option value="custom">自选目录…</option>
       </select>
-      <button
-        class="path-display"
-        type="button"
-        :title="root"
-        :disabled="isBusy"
-        @click="chooseRoot"
-      >
-        {{ root }}
-      </button>
+      <div class="path-picker" :class="{ disabled: isBusy }">
+        <input
+          class="path-display"
+          type="text"
+          :value="root"
+          :title="root"
+          readonly
+          aria-label="当前分析目录"
+        />
+        <button
+          type="button"
+          title="选择分析目录"
+          aria-label="选择分析目录"
+          :disabled="isBusy"
+          @click="chooseRoot"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path
+              d="M2.75 5.25A1.75 1.75 0 0 1 4.5 3.5h3.1l1.45 1.6h6.45a1.75 1.75 0 0 1 1.75 1.75v7.4A1.75 1.75 0 0 1 15.5 16H4.5a1.75 1.75 0 0 1-1.75-1.75v-9Z"
+            />
+          </svg>
+        </button>
+      </div>
       <BaseButton
         variant="primary"
         :disabled="isBusy"
@@ -391,6 +405,7 @@ const notifyError = (error: unknown): void => {
         :selected-path="selectedPath"
         :sort-field="sortField"
         :sort-direction="sortDirection"
+        :total-allocated-bytes="scanPage?.totalAllocatedBytes ?? 0"
         @select="selected = $event"
         @sort="changeSort"
         @open="openFolder"
@@ -496,7 +511,7 @@ const notifyError = (error: unknown): void => {
 }
 
 select,
-.path-display {
+.path-picker {
   height: var(--control-height);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-small);
@@ -508,12 +523,57 @@ select {
   padding: 0 var(--space-2);
 }
 
+.path-picker {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) var(--control-height);
+  overflow: hidden;
+}
+
 .path-display {
+  min-width: 0;
+  border: 0;
+  outline: 0;
   overflow: hidden;
   padding: 0 var(--space-3);
+  color: var(--text-primary);
+  background: transparent;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.path-picker > button {
+  display: grid;
+  width: var(--control-height);
+  height: 100%;
+  place-items: center;
+  border-left: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  background: var(--surface-secondary);
+}
+
+.path-picker > button:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--surface-hover);
+}
+
+.path-picker > button:disabled {
+  color: var(--text-disabled);
+}
+
+.path-picker svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+}
+
+.path-picker.disabled {
+  opacity: 0.7;
 }
 
 .task-progress {

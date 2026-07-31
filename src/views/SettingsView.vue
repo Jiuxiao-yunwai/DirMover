@@ -91,7 +91,7 @@ const openManagedRoot = async (): Promise<void> => {
     </header>
 
     <div v-if="hasOnlySystemDrive" class="warning-strip">
-      当前只检测到系统盘，默认托管已停用。连接其他固定 NTFS 分区后才能迁移目录。
+      当前只检测到一个固定 NTFS 分区，默认托管将回退到 C 盘；迁移同分区目录时仍需另选其他分区。
     </div>
 
     <section class="settings-section">
@@ -102,7 +102,7 @@ const openManagedRoot = async (): Promise<void> => {
             {{
               bootstrap.settings.managedRoot
                 ? "使用手动设置的统一根目录"
-                : "自动选择盘符靠后的非系统 NTFS 分区"
+                : "优先选择系统盘同一物理磁盘上的最后一个 NTFS 分区"
             }}
           </p>
         </div>

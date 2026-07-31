@@ -50,6 +50,7 @@ const invokeMenu = (action: "open" | "copy"): void => {
           <tr
             v-for="row in rows"
             :key="`${row.scanRoot}:${row.path}`"
+            data-app-context-menu
             :class="{ selected: selectedPath === row.path }"
             tabindex="0"
             @click="$emit('select', row)"

@@ -6,8 +6,8 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{
     create_junction, drive_info, fixed_ntfs_drives, is_administrator, is_reparse_point,
-    link_target, mark_hidden, open_in_file_manager, relaunch_elevated, remove_junction,
-    replace_file, scan_mft_children,
+    link_target, mark_hidden, open_in_file_manager, physical_disk_location, relaunch_elevated,
+    remove_junction, replace_file, scan_mft_children,
 };
 
 #[cfg(not(windows))]
@@ -29,6 +29,12 @@ mod portable {
     pub fn drive_info(_path: &Path) -> AppResult<DriveInfo> {
         Err(AppError::Platform(
             "磁盘信息读取目前仅支持 Windows。".to_string(),
+        ))
+    }
+
+    pub fn physical_disk_location(_path: &Path) -> AppResult<(u32, u32)> {
+        Err(AppError::Platform(
+            "物理磁盘识别目前仅支持 Windows。".to_string(),
         ))
     }
 

@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, AppResult},
-    models::{AppSettings, ManagedCategory, ManagedCategoryRow, ScanPreset},
+    models::{AppSettings, DriveInfo, ManagedCategory, ManagedCategoryRow, ScanPreset},
     platform,
 };
 use std::path::{Component, Path, PathBuf};
@@ -107,13 +107,41 @@ pub fn scan_presets() -> Vec<ScanPreset> {
 pub fn automatic_managed_root() -> Option<PathBuf> {
     let drives = platform::fixed_ntfs_drives();
     let system_root = system_drive_root();
-    let candidates = drives
-        .into_iter()
-        .filter(|drive| !path_text_equal(&drive.root, &system_root))
-        .collect::<Vec<_>>();
-    candidates
-        .last()
-        .map(|drive| Path::new(&drive.root).join(MANAGED_FOLDER_NAME))
+    let system_disk = platform::physical_disk_location(Path::new(&system_root))
+        .ok()
+        .map(|(disk, _)| disk);
+    select_automatic_drive(&drives, system_disk, |root| {
+        platform::physical_disk_location(Path::new(root)).ok()
+    })
+    .map(|drive| Path::new(&drive.root).join(MANAGED_FOLDER_NAME))
+}
+
+fn select_automatic_drive(
+    drives: &[DriveInfo],
+    system_disk: Option<u32>,
+    disk_location: impl Fn(&str) -> Option<(u32, u32)>,
+) -> Option<&DriveInfo> {
+    system_disk
+        .and_then(|number| {
+            drives
+                .iter()
+                .filter_map(|drive| {
+                    let (disk, partition) = disk_location(&drive.root)?;
+                    (disk == number).then_some((drive, partition))
+                })
+                .max_by_key(|(_, partition)| *partition)
+                .map(|(drive, _)| drive)
+        })
+        .or_else(|| {
+            drives
+                .iter()
+                .find(|drive| path_text_equal(&drive.root, r"D:\"))
+        })
+        .or_else(|| {
+            drives
+                .iter()
+                .find(|drive| path_text_equal(&drive.root, r"C:\"))
+        })
 }
 
 pub fn category_for_source(source: &Path) -> ManagedCategory {
@@ -302,7 +330,9 @@ fn path_text_equal(left: &str, right: &str) -> bool {
 mod tests {
     use super::{
         categories, category_for_source, destination_under_category, paths_equal, same_or_inside,
+        select_automatic_drive,
     };
+    use crate::models::DriveInfo;
     use std::path::Path;
 
     #[test]
@@ -334,5 +364,33 @@ mod tests {
         .expect("destination should be planned");
         assert!(destination.ends_with("Vendor"));
         assert!(categories().iter().any(|item| item.key == "Other"));
+    }
+
+    #[test]
+    fn selects_last_partition_on_system_disk_then_falls_back_to_d_or_c() {
+        let drives = ["C:\\", "D:\\", "E:\\"]
+            .into_iter()
+            .map(|root| DriveInfo {
+                root: root.to_string(),
+                file_system: "NTFS".to_string(),
+                total_bytes: 1,
+                free_bytes: 1,
+                fixed: true,
+                ready: true,
+            })
+            .collect::<Vec<_>>();
+        let same_disk = select_automatic_drive(&drives, Some(0), |root| match root {
+            "C:\\" => Some((0, 3)),
+            "D:\\" => Some((1, 2)),
+            "E:\\" => Some((0, 5)),
+            _ => None,
+        });
+        assert_eq!(same_disk.map(|drive| drive.root.as_str()), Some("E:\\"));
+
+        let fallback_d = select_automatic_drive(&drives, None, |_| None);
+        assert_eq!(fallback_d.map(|drive| drive.root.as_str()), Some("D:\\"));
+
+        let only_c = select_automatic_drive(&drives[..1], None, |_| None);
+        assert_eq!(only_c.map(|drive| drive.root.as_str()), Some("C:\\"));
     }
 }

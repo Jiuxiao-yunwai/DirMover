@@ -25,8 +25,12 @@ const { preference: theme } = useTheme();
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
 onMounted(loadBootstrap);
+onMounted(() => {
+  document.addEventListener("contextmenu", suppressNativeContextMenu);
+});
 onBeforeUnmount(() => {
   if (toastTimer) clearTimeout(toastTimer);
+  document.removeEventListener("contextmenu", suppressNativeContextMenu);
 });
 
 async function loadBootstrap(): Promise<void> {
@@ -57,6 +61,13 @@ function notify(message: string, tone: ToastTone = "info"): void {
   toastTimer = setTimeout(() => {
     toast.value = null;
   }, tone === "error" ? 6500 : 4000);
+}
+
+function suppressNativeContextMenu(event: MouseEvent): void {
+  const target = event.target;
+  if (!(target instanceof Element) || !target.closest("[data-app-context-menu]")) {
+    event.preventDefault();
+  }
 }
 </script>
 

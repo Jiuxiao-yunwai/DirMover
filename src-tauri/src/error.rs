@@ -26,10 +26,12 @@ pub enum AppError {
     Platform(String),
     #[error("{0}")]
     Task(String),
+    #[error("任务已取消。")]
+    Cancelled,
 }
 
 impl AppError {
-    fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidInput(_) => "invalid_input",
             Self::NotFound(_) => "not_found",
@@ -39,10 +41,11 @@ impl AppError {
             Self::Json(_) => "invalid_data",
             Self::Platform(_) => "platform_error",
             Self::Task(_) => "task_error",
+            Self::Cancelled => "cancelled",
         }
     }
 
-    fn recoverable(&self) -> bool {
+    pub fn recoverable(&self) -> bool {
         !matches!(self, Self::InvalidInput(_) | Self::Platform(_))
     }
 }

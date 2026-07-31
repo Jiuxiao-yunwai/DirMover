@@ -1,0 +1,130 @@
+<Window x:Class="DirMover.MigrationOptionsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="选择迁移位置" Width="680" Height="520"
+        MinWidth="620" MinHeight="480"
+        ResizeMode="CanResizeWithGrip"
+        WindowStartupLocation="CenterOwner"
+        Background="#F5F7FB"
+        FontFamily="Segoe UI Variable Text, Microsoft YaHei UI">
+    <Window.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="pack://application:,,,/PresentationFramework.Fluent;component/Themes/Fluent.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+            <Style x:Key="OptionCard" TargetType="Border">
+                <Setter Property="Background" Value="White"/>
+                <Setter Property="BorderBrush" Value="#DCE3ED"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="CornerRadius" Value="12"/>
+                <Setter Property="Padding" Value="16"/>
+                <Setter Property="Margin" Value="0,0,0,12"/>
+            </Style>
+            <Style x:Key="PrimaryButton" TargetType="Button">
+                <Setter Property="Background" Value="#2563EB"/>
+                <Setter Property="Foreground" Value="White"/>
+                <Setter Property="BorderBrush" Value="#2563EB"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
+                <Setter Property="Padding" Value="18,9"/>
+            </Style>
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Border Background="White" BorderBrush="#E2E8F0" BorderThickness="0,0,0,1"
+                Padding="24,18">
+            <StackPanel>
+                <TextBlock Text="选择本次迁移位置" FontSize="21" FontWeight="SemiBold"
+                           Foreground="#0F172A"/>
+                <TextBlock x:Name="SourceText" Margin="0,5,0,0" Foreground="#64748B"
+                           TextTrimming="CharacterEllipsis"/>
+            </StackPanel>
+        </Border>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="24,20">
+                <Border x:Name="SingleDriveWarning" Visibility="Collapsed"
+                        Background="#FFF7ED" BorderBrush="#FED7AA" BorderThickness="1"
+                        CornerRadius="10" Padding="14" Margin="0,0,0,14">
+                    <TextBlock Text="当前只检测到系统盘。此软件无法在同一分区内释放空间，请连接另一块 NTFS 磁盘后选择自定义位置。"
+                               Foreground="#9A3412" TextWrapping="Wrap"/>
+                </Border>
+
+                <Border Style="{StaticResource OptionCard}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <RadioButton x:Name="ManagedOption" GroupName="DestinationMode"
+                                     VerticalAlignment="Top" Margin="0,3,12,0"
+                                     Checked="DestinationMode_Changed"/>
+                        <StackPanel Grid.Column="1">
+                            <TextBlock Text="使用统一托管位置" FontSize="15" FontWeight="SemiBold"
+                                       Foreground="#0F172A"/>
+                            <TextBlock Text="按照来源自动归类，后续迁移都保持一致。"
+                                       Foreground="#64748B" Margin="0,3,0,8"/>
+                            <TextBlock x:Name="ManagedPathText" Foreground="#2563EB"
+                                       FontFamily="Consolas" TextWrapping="Wrap"/>
+                            <TextBlock x:Name="ManagedReasonText" Foreground="#B45309"
+                                       Margin="0,6,0,0" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <Border Style="{StaticResource OptionCard}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <RadioButton x:Name="CustomOption" GroupName="DestinationMode"
+                                     VerticalAlignment="Top" Margin="0,3,12,0"
+                                     Checked="DestinationMode_Changed"/>
+                        <StackPanel Grid.Column="1">
+                            <TextBlock Text="本次自定义托管位置" FontSize="15" FontWeight="SemiBold"
+                                       Foreground="#0F172A"/>
+                            <TextBlock Text="只影响当前选中的文件夹，不修改全局设置。"
+                                       Foreground="#64748B" Margin="0,3,0,9"/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="CustomPathText" IsReadOnly="True" Height="34"
+                                         VerticalContentAlignment="Center"/>
+                                <Button Grid.Column="1" Content="选择…" Margin="8,0,0,0"
+                                        Padding="14,7" Click="BrowseCustom_Click"/>
+                            </Grid>
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <Border Background="#EFF6FF" BorderBrush="#BFDBFE" BorderThickness="1"
+                        CornerRadius="10" Padding="14">
+                    <StackPanel>
+                        <TextBlock Text="最终位置" Foreground="#1E40AF" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="DestinationPreviewText" Margin="0,6,0,0"
+                                   Foreground="#1D4ED8" FontFamily="Consolas"
+                                   TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+
+        <Border Grid.Row="2" Background="White" BorderBrush="#E2E8F0"
+                BorderThickness="0,1,0,0" Padding="24,14">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="取消" Padding="18,9" IsCancel="True"/>
+                <Button Content="继续迁移" Margin="10,0,0,0"
+                        Style="{StaticResource PrimaryButton}" Click="Confirm_Click"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

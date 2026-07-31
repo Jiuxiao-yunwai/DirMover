@@ -87,4 +87,8 @@ npm run package
 
 构建完成后，NSIS EXE 与 MSI 安装包会统一汇总到 `artifacts\releases\<版本号>\`。Windows 安装界面固定使用简体中文。
 
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
+
 更多设计说明见 [架构文档](docs/architecture.md)。

@@ -7,6 +7,7 @@ import BaseProgress from "@/components/base/BaseProgress.vue";
 import FolderTable from "@/components/business/FolderTable.vue";
 import MigrationDestinationDialog from "@/components/business/MigrationDestinationDialog.vue";
 import { api } from "@/services/api";
+import { createScanSessionCache } from "@/services/scanSessionCache";
 import { normalizeAppError } from "@/services/tauri";
 import type {
   BootstrapData,
@@ -46,6 +47,7 @@ const managedPlan = shallowRef<MigrationPlan | null>(null);
 const customPlan = shallowRef<MigrationPlan | null>(null);
 const pendingPlan = shallowRef<MigrationPlan | null>(null);
 const confirmMigrationOpen = ref(false);
+const scanCache = createScanSessionCache();
 
 const isBusy = computed(
   () => loadingPreview.value || activeTask.value?.state === "running",
@@ -95,10 +97,22 @@ const changePreset = async (event: Event): Promise<void> => {
 
 const loadPreview = async (): Promise<void> => {
   if (!root.value) return;
+  selected.value = null;
+  const cached = scanCache.get(root.value);
+  if (cached) {
+    sortField.value = cached.sortField;
+    sortDirection.value = cached.sortDirection;
+    scanPage.value = cached.page;
+    rows.value = cached.page.items;
+    emit(
+      "status",
+      `已恢复扫描缓存（${cached.page.engine}）：${formatInteger(cached.page.totalItems)} 个文件夹`,
+    );
+    return;
+  }
   loadingPreview.value = true;
   emit("busy", true);
   emit("status", `正在列出 ${root.value} 的一级文件夹…`);
-  selected.value = null;
   scanPage.value = null;
   try {
     rows.value = await api.preview(root.value);
@@ -155,17 +169,23 @@ const onTaskEvent = (event: TaskEvent): void => {
 
 const loadScanPage = async (resultId: string): Promise<void> => {
   try {
-    scanPage.value = await api.scanPage(resultId, {
+    const page = await api.scanPage(resultId, {
       page: 1,
       pageSize: 500,
       sortField: sortField.value,
       sortDirection: sortDirection.value,
     });
-    rows.value = scanPage.value.items;
+    scanPage.value = page;
+    rows.value = page.items;
     selected.value = null;
+    scanCache.set(page.root, {
+      page,
+      sortField: sortField.value,
+      sortDirection: sortDirection.value,
+    });
     emit(
       "status",
-      `扫描完成（${scanPage.value.engine}）：${formatInteger(scanPage.value.totalItems)} 个文件夹`,
+      `扫描完成（${page.engine}）：${formatInteger(page.totalItems)} 个文件夹`,
     );
   } catch (error: unknown) {
     notifyError(error);

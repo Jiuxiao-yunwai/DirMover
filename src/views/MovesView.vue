@@ -152,10 +152,7 @@ const notifyError = (error: unknown): void => {
 <template>
   <section class="view">
     <header class="page-header">
-      <div>
-        <h1>迁移记录</h1>
-        <p>核对目录联接、处理异常中断，并将数据还原到原磁盘</p>
-      </div>
+      <h1>迁移记录</h1>
       <span>{{ rows.length }} 条记录</span>
     </header>
 

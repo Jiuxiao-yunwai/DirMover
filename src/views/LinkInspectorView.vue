@@ -61,17 +61,13 @@ const copyLink = async (row: LinkRow): Promise<void> => {
 <template>
   <section class="view">
     <header class="page-header">
-      <div>
-        <h1>链接检测</h1>
-        <p>检测所选目录的直接子项，不递归进入普通目录或链接目标</p>
-      </div>
+      <h1>链接检测</h1>
       <span>{{ rows.length }} 条记录</span>
     </header>
     <div class="toolbar">
       <BaseButton variant="primary" :loading="busy" @click="detect">
         选择目录并检测
       </BaseButton>
-      <span>扫描空间时发现的直接链接也会自动记录在这里。</span>
     </div>
     <section class="content-panel">
       <LinkTable

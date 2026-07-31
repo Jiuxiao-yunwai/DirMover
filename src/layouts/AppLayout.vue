@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { ref, watch } from "vue";
 import type { ThemePreference } from "@/types/domain";
 
-export type ViewKey = "space" | "moves" | "links" | "settings";
+export type ViewKey = "space" | "moves" | "links" | "settings" | "help";
 
 defineProps<{
   activeView: ViewKey;
@@ -16,22 +17,29 @@ defineEmits<{
   "update:theme": [theme: ThemePreference];
 }>();
 
-const navigation: Array<{ key: ViewKey; label: string; description: string }> = [
-  { key: "space", label: "空间分析", description: "扫描与迁移" },
-  { key: "moves", label: "迁移记录", description: "检查与还原" },
-  { key: "links", label: "链接检测", description: "直接子项" },
-  { key: "settings", label: "设置", description: "托管位置" },
+const navigation: Array<{ key: ViewKey; label: string; icon: string }> = [
+  { key: "space", label: "空间分析", icon: "▦" },
+  { key: "moves", label: "迁移记录", icon: "↔" },
+  { key: "links", label: "链接检测", icon: "⌁" },
+  { key: "settings", label: "设置", icon: "⚙" },
+  { key: "help", label: "帮助", icon: "?" },
 ];
+
+const sidebarStorageKey = "dirmover.sidebar.collapsed";
+const collapsed = ref(localStorage.getItem(sidebarStorageKey) === "true");
+
+watch(collapsed, (value) => {
+  localStorage.setItem(sidebarStorageKey, String(value));
+});
 </script>
 
 <template>
-  <div class="app-layout">
+  <div class="app-layout" :class="{ collapsed }">
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">D</div>
-        <div>
+        <div class="brand-copy">
           <strong>DirMover</strong>
-          <span>目录迁移工具</span>
         </div>
       </div>
 
@@ -40,17 +48,18 @@ const navigation: Array<{ key: ViewKey; label: string; description: string }> = 
           v-for="item in navigation"
           :key="item.key"
           type="button"
+          :title="collapsed ? item.label : undefined"
           :class="{ active: activeView === item.key }"
           :aria-current="activeView === item.key ? 'page' : undefined"
           @click="$emit('navigate', item.key)"
         >
-          <strong>{{ item.label }}</strong>
-          <span>{{ item.description }}</span>
+          <span class="nav-icon" aria-hidden="true">{{ item.icon }}</span>
+          <strong class="nav-label">{{ item.label }}</strong>
         </button>
       </nav>
 
       <div class="sidebar-footer">
-        <label>
+        <label class="theme-control">
           <span>主题</span>
           <select
             :value="theme"
@@ -70,6 +79,16 @@ const navigation: Array<{ key: ViewKey; label: string; description: string }> = 
           <span class="state-dot" :class="{ admin: isAdministrator }" />
           {{ isAdministrator ? "管理员模式 · MFT 可用" : "普通模式 · 扫描时提权" }}
         </div>
+        <button
+          class="collapse-toggle"
+          type="button"
+          :title="collapsed ? '展开菜单' : '折叠菜单'"
+          :aria-label="collapsed ? '展开菜单' : '折叠菜单'"
+          @click="collapsed = !collapsed"
+        >
+          <span aria-hidden="true">{{ collapsed ? "›" : "‹" }}</span>
+          <strong>{{ collapsed ? "" : "折叠菜单" }}</strong>
+        </button>
       </div>
     </aside>
 
@@ -95,6 +114,11 @@ const navigation: Array<{ key: ViewKey; label: string; description: string }> = 
   height: 100vh;
   color: var(--text-primary);
   background: var(--surface-app);
+  transition: grid-template-columns var(--duration-normal) var(--ease-standard);
+}
+
+.app-layout.collapsed {
+  grid-template-columns: 64px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -114,6 +138,11 @@ const navigation: Array<{ key: ViewKey; label: string; description: string }> = 
   padding-inline: var(--space-2);
 }
 
+.collapsed .brand {
+  justify-content: center;
+  padding-inline: 0;
+}
+
 .brand-mark {
   display: grid;
   width: 32px;
@@ -126,7 +155,7 @@ const navigation: Array<{ key: ViewKey; label: string; description: string }> = 
   font-weight: 700;
 }
 
-.brand div:last-child {
+.brand-copy {
   display: grid;
 }
 
@@ -135,9 +164,10 @@ const navigation: Array<{ key: ViewKey; label: string; description: string }> = 
   font-weight: 650;
 }
 
-.brand span {
-  color: var(--text-secondary);
-  font-size: 11px;
+.collapsed .brand-copy,
+.collapsed .theme-control,
+.collapsed .engine-state {
+  display: none;
 }
 
 nav {
@@ -148,15 +178,21 @@ nav {
 }
 
 nav button {
-  display: grid;
-  gap: 1px;
-  min-height: 48px;
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: var(--space-3);
   padding: 7px var(--space-3);
   border-left: 3px solid transparent;
   border-radius: var(--radius-small);
   color: var(--text-secondary);
   background: transparent;
   text-align: left;
+}
+
+.collapsed nav button {
+  justify-content: center;
+  padding: 7px 0;
 }
 
 nav button:hover {
@@ -174,8 +210,17 @@ nav strong {
   font-weight: 600;
 }
 
-nav span {
-  font-size: 11px;
+.nav-icon {
+  display: grid;
+  width: 20px;
+  flex: 0 0 20px;
+  place-items: center;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.collapsed .nav-label {
+  display: none;
 }
 
 .sidebar-footer {
@@ -205,6 +250,36 @@ select {
 .engine-state {
   color: var(--text-secondary);
   font-size: 11px;
+}
+
+.collapse-toggle {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  border-radius: var(--radius-small);
+  color: var(--text-secondary);
+  background: transparent;
+}
+
+.collapse-toggle:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+
+.collapse-toggle span {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.collapse-toggle strong {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.collapsed .sidebar-footer {
+  padding-inline: 0;
 }
 
 .state-dot,

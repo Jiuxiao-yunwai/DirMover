@@ -84,10 +84,7 @@ const openManagedRoot = async (): Promise<void> => {
 <template>
   <section class="view">
     <header class="page-header">
-      <div>
-        <h1>设置</h1>
-        <p>配置统一托管位置，或为不同来源单独指定固定 NTFS 分区</p>
-      </div>
+      <h1>设置</h1>
     </header>
 
     <div v-if="hasOnlySystemDrive" class="warning-strip">
@@ -96,16 +93,7 @@ const openManagedRoot = async (): Promise<void> => {
 
     <section class="settings-section">
       <header>
-        <div>
-          <h2>托管位置</h2>
-          <p>
-            {{
-              bootstrap.settings.managedRoot
-                ? "使用手动设置的统一根目录"
-                : "优先选择系统盘同一物理磁盘上的最后一个 NTFS 分区"
-            }}
-          </p>
-        </div>
+        <h2>托管位置</h2>
         <div class="actions">
           <BaseButton :disabled="busy" @click="chooseManagedRoot">
             更改统一根目录

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
 import BaseButton from "@/components/base/BaseButton.vue";
 import BaseProgress from "@/components/base/BaseProgress.vue";
 import AppLayout, { type ViewKey } from "@/layouts/AppLayout.vue";
@@ -11,6 +11,7 @@ import LinkInspectorView from "@/views/LinkInspectorView.vue";
 import MovesView from "@/views/MovesView.vue";
 import SettingsView from "@/views/SettingsView.vue";
 import SpaceAnalysisView from "@/views/SpaceAnalysisView.vue";
+import HelpView from "@/views/HelpView.vue";
 
 type ToastTone = "info" | "success" | "warning" | "error";
 
@@ -19,7 +20,13 @@ const bootstrapError = ref("");
 const loading = ref(true);
 const activeView = ref<ViewKey>("space");
 const status = ref("正在启动…");
-const busy = ref(false);
+const busyByView = ref({
+  space: false,
+  moves: false,
+  links: false,
+  settings: false,
+});
+const busy = computed(() => Object.values(busyByView.value).some(Boolean));
 const toast = ref<{ message: string; tone: ToastTone } | null>(null);
 const { preference: theme } = useTheme();
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -63,6 +70,13 @@ function notify(message: string, tone: ToastTone = "info"): void {
   }, tone === "error" ? 6500 : 4000);
 }
 
+function setViewBusy(
+  view: keyof typeof busyByView.value,
+  value: boolean,
+): void {
+  busyByView.value = { ...busyByView.value, [view]: value };
+}
+
 function suppressNativeContextMenu(event: MouseEvent): void {
   const target = event.target;
   if (!(target instanceof Element) || !target.closest("[data-app-context-menu]")) {
@@ -95,38 +109,45 @@ function suppressNativeContextMenu(event: MouseEvent): void {
     @navigate="activeView = $event"
     @update:theme="theme = $event"
   >
-    <SpaceAnalysisView
-      v-if="activeView === 'space'"
-      :bootstrap="bootstrap"
-      @status="status = $event"
-      @busy="busy = $event"
-      @refresh-data="refreshBootstrap"
-      @notify="notify"
-    />
-    <MovesView
-      v-else-if="activeView === 'moves'"
-      :bootstrap="bootstrap"
-      @status="status = $event"
-      @busy="busy = $event"
-      @refresh-data="refreshBootstrap"
-      @notify="notify"
-    />
-    <LinkInspectorView
-      v-else-if="activeView === 'links'"
-      :bootstrap="bootstrap"
-      @status="status = $event"
-      @busy="busy = $event"
-      @refresh-data="refreshBootstrap"
-      @notify="notify"
-    />
-    <SettingsView
-      v-else
-      :bootstrap="bootstrap"
-      @status="status = $event"
-      @busy="busy = $event"
-      @refresh-data="refreshBootstrap"
-      @notify="notify"
-    />
+    <div v-show="activeView === 'space'" class="view-host">
+      <SpaceAnalysisView
+        :bootstrap="bootstrap"
+        @status="status = $event"
+        @busy="setViewBusy('space', $event)"
+        @refresh-data="refreshBootstrap"
+        @notify="notify"
+      />
+    </div>
+    <div v-show="activeView === 'moves'" class="view-host">
+      <MovesView
+        :bootstrap="bootstrap"
+        @status="status = $event"
+        @busy="setViewBusy('moves', $event)"
+        @refresh-data="refreshBootstrap"
+        @notify="notify"
+      />
+    </div>
+    <div v-show="activeView === 'links'" class="view-host">
+      <LinkInspectorView
+        :bootstrap="bootstrap"
+        @status="status = $event"
+        @busy="setViewBusy('links', $event)"
+        @refresh-data="refreshBootstrap"
+        @notify="notify"
+      />
+    </div>
+    <div v-show="activeView === 'settings'" class="view-host">
+      <SettingsView
+        :bootstrap="bootstrap"
+        @status="status = $event"
+        @busy="setViewBusy('settings', $event)"
+        @refresh-data="refreshBootstrap"
+        @notify="notify"
+      />
+    </div>
+    <div v-show="activeView === 'help'" class="view-host">
+      <HelpView />
+    </div>
   </AppLayout>
 
   <Transition name="toast">
@@ -138,6 +159,12 @@ function suppressNativeContextMenu(event: MouseEvent): void {
 </template>
 
 <style scoped>
+.view-host {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
 .startup {
   display: grid;
   width: 100vw;

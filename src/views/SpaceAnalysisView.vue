@@ -218,10 +218,6 @@ const prepareMigration = async (): Promise<void> => {
     emit("notify", "请先选择一个文件夹。", "warning");
     return;
   }
-  if (!row.measured) {
-    emit("notify", "请先完成扫描，再迁移该目录。", "warning");
-    return;
-  }
   if (row.isLink || row.linkCount > 0) {
     emit("notify", "目录本身或内部含有链接，安全检查未通过。", "warning");
     return;
@@ -299,10 +295,7 @@ const notifyError = (error: unknown): void => {
 <template>
   <section class="view">
     <header class="page-header">
-      <div>
-        <h1>空间分析</h1>
-        <p>查看一级目录占用，并将选中的目录安全迁移到其他 NTFS 分区</p>
-      </div>
+      <h1>空间分析</h1>
       <span class="engine-badge">{{ engineLabel }}</span>
     </header>
 
@@ -394,10 +387,7 @@ const notifyError = (error: unknown): void => {
 
     <section class="content-panel">
       <header>
-        <div>
-          <strong>目录明细</strong>
-          <span>双击打开，右键可复制路径</span>
-        </div>
+        <strong>目录明细</strong>
         <span v-if="loadingPreview">正在读取…</span>
       </header>
       <FolderTable

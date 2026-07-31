@@ -3,8 +3,8 @@ use crate::{
     models::ScanProgress,
     tasks::CancellationFlag,
 };
+use rustc_hash::FxHashMap as HashMap;
 use std::{
-    collections::HashMap,
     fs::{File, OpenOptions},
     os::windows::{
         fs::{FileExt, OpenOptionsExt},
@@ -29,6 +29,7 @@ const ATTRIBUTE_DATA: u32 = 0x80;
 const ATTRIBUTE_REPARSE_POINT: u32 = 0xC0;
 const ATTRIBUTE_END: u32 = 0xFFFF_FFFF;
 const RECORD_NUMBER_MASK: i64 = 0x0000_FFFF_FFFF_FFFF;
+const MFT_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct MftFolder {
@@ -97,6 +98,13 @@ struct FolderAggregate {
     files: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ParentAggregate {
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    files: u64,
+}
+
 pub fn scan_mft_children(
     root: &Path,
     cancellation: &CancellationFlag,
@@ -126,7 +134,9 @@ pub fn scan_mft_children(
     let data = ntfs_volume_data(&volume)?;
     validate_volume_data(&data)?;
     let runs = read_mft_runs(&volume, &data)?;
-    let mut directories = HashMap::new();
+    let mut directories = HashMap::default();
+    let mut files_by_parent = HashMap::<i64, ParentAggregate>::default();
+    let mut links = Vec::new();
 
     read_records(
         &volume,
@@ -134,37 +144,52 @@ pub fn scan_mft_children(
         &runs,
         cancellation,
         |id, record| {
-            if record.is_directory
-                && let Some(name) = record.name
-            {
-                directories.insert(
-                    id,
-                    DirectoryNode {
-                        parent_id: record.parent_id,
-                        name,
-                        is_reparse: record.is_reparse,
-                    },
-                );
+            if record.is_directory {
+                if let Some(name) = record.name {
+                    directories.insert(
+                        id,
+                        DirectoryNode {
+                            parent_id: record.parent_id,
+                            name,
+                            is_reparse: record.is_reparse,
+                        },
+                    );
+                }
+                return;
             }
+            if record.is_reparse {
+                if record.parent_id == root_id
+                    && let Some(name) = record.name
+                {
+                    links.push((root.join(name), false));
+                }
+                return;
+            }
+            let aggregate = files_by_parent.entry(record.parent_id).or_default();
+            aggregate.logical_bytes = aggregate.logical_bytes.saturating_add(record.logical_bytes);
+            aggregate.allocated_bytes = aggregate
+                .allocated_bytes
+                .saturating_add(record.allocated_bytes);
+            aggregate.files = aggregate.files.saturating_add(1);
         },
         |value| {
             progress(ScanProgress {
-                percentage: 5 + (value * 40.0) as u8,
-                phase: "mft-directories".to_string(),
-                message: "正在读取 MFT 目录记录…".to_string(),
+                percentage: 5 + (value * 80.0) as u8,
+                phase: "mft-read".to_string(),
+                message: "正在单遍读取 MFT…".to_string(),
             });
         },
     )?;
     cancellation.check()?;
     progress(ScanProgress {
-        percentage: 47,
-        phase: "mft-index".to_string(),
-        message: "正在建立目录索引…".to_string(),
+        percentage: 86,
+        phase: "mft-aggregate".to_string(),
+        message: "正在汇总目录占用…".to_string(),
     });
 
-    let mut top_by_directory = HashMap::from([(root_id, 0_i64)]);
-    let mut aggregates = HashMap::new();
-    let mut links = Vec::new();
+    let mut top_by_directory = HashMap::default();
+    top_by_directory.insert(root_id, 0_i64);
+    let mut aggregates = HashMap::default();
     for (id, directory) in &directories {
         if directory.parent_id == root_id {
             aggregates.insert(
@@ -183,48 +208,26 @@ pub fn scan_mft_children(
         }
     }
 
-    read_records(
-        &volume,
-        &data,
-        &runs,
-        cancellation,
-        |_, record| {
-            if record.is_directory {
-                return;
-            }
-            let Some(name) = record.name else {
-                return;
-            };
-            if record.is_reparse && record.parent_id == root_id {
-                links.push((root.join(name), false));
-                return;
-            }
-            let top = resolve_top(
-                record.parent_id,
-                root_id,
-                &directories,
-                &mut top_by_directory,
-            );
-            let Some(aggregate) = aggregates.get_mut(&top) else {
-                return;
-            };
-            if !record.is_reparse {
-                aggregate.logical_bytes =
-                    aggregate.logical_bytes.saturating_add(record.logical_bytes);
-                aggregate.allocated_bytes = aggregate
-                    .allocated_bytes
-                    .saturating_add(record.allocated_bytes);
-                aggregate.files += 1;
-            }
-        },
-        |value| {
+    let parent_count = files_by_parent.len().max(1);
+    for (index, (parent_id, stats)) in files_by_parent.into_iter().enumerate() {
+        if index % 4096 == 0 {
+            cancellation.check()?;
             progress(ScanProgress {
-                percentage: 50 + (value * 45.0) as u8,
-                phase: "mft-size".to_string(),
-                message: "正在统计文件大小…".to_string(),
+                percentage: 86 + u8::try_from(index.saturating_mul(9) / parent_count).unwrap_or(8),
+                phase: "mft-aggregate".to_string(),
+                message: "正在汇总目录占用…".to_string(),
             });
-        },
-    )?;
+        }
+        let top = resolve_top(parent_id, root_id, &directories, &mut top_by_directory);
+        let Some(aggregate) = aggregates.get_mut(&top) else {
+            continue;
+        };
+        aggregate.logical_bytes = aggregate.logical_bytes.saturating_add(stats.logical_bytes);
+        aggregate.allocated_bytes = aggregate
+            .allocated_bytes
+            .saturating_add(stats.allocated_bytes);
+        aggregate.files = aggregate.files.saturating_add(stats.files);
+    }
 
     cancellation.check()?;
     progress(ScanProgress {
@@ -258,7 +261,8 @@ fn read_records(
     let record_size = usize::try_from(data.bytes_per_file_record_segment)
         .map_err(|_| invalid_mft("MFT 文件记录大小无效。"))?;
     let valid_length = data.mft_valid_data_length;
-    let chunk_size = (4 * 1024 * 1024 / record_size).max(1) * record_size;
+    let chunk_size = (MFT_READ_CHUNK_BYTES / record_size).max(1) * record_size;
+    let mut buffer = vec![0_u8; chunk_size];
 
     let mut ordered_runs = runs.to_vec();
     ordered_runs.sort_by_key(|run| run.virtual_cluster);
@@ -286,18 +290,17 @@ fn read_records(
             if length == 0 {
                 break;
             }
-            let mut buffer = vec![0_u8; length];
             let offset = checked_add(
                 checked_mul(run.logical_cluster, i64::from(data.bytes_per_cluster))?,
                 consumed,
             )?;
             read_exact_at(
                 volume,
-                &mut buffer,
+                &mut buffer[..length],
                 u64::try_from(offset).map_err(|_| invalid_mft("MFT 偏移无效。"))?,
             )?;
             let first_record = (virtual_start + consumed) / i64::try_from(record_size).unwrap_or(1);
-            for (index, record) in buffer.chunks_exact_mut(record_size).enumerate() {
+            for (index, record) in buffer[..length].chunks_exact_mut(record_size).enumerate() {
                 if apply_fixup(
                     record,
                     usize::try_from(data.bytes_per_sector)
@@ -423,7 +426,7 @@ fn parse_record(record: &[u8]) -> Option<ParsedRecord> {
     }
 
     let mut is_directory = flags & 2 != 0;
-    let mut name = None;
+    let mut name_span = None;
     let mut parent_id = 0_i64;
     let mut file_attributes = 0_u32;
     let mut has_reparse_attribute = false;
@@ -461,11 +464,7 @@ fn parse_record(record: &[u8]) -> Option<ParsedRecord> {
                     _ => 0,
                 };
                 if score > best_namespace && 66 + name_length * 2 <= value_length {
-                    let utf16 = record[value + 66..value + 66 + name_length * 2]
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                        .collect::<Vec<_>>();
-                    name = Some(String::from_utf16_lossy(&utf16));
+                    name_span = Some((value + 66, name_length));
                     parent_id = read_i64(record, value).ok()? & RECORD_NUMBER_MASK;
                     file_attributes = read_u32(record, value + 56).ok()?;
                     best_namespace = score;
@@ -484,11 +483,25 @@ fn parse_record(record: &[u8]) -> Option<ParsedRecord> {
     }
 
     is_directory |= file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let is_reparse = has_reparse_attribute || file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    let name = if is_directory || is_reparse {
+        name_span.map(|(start, length)| {
+            std::char::decode_utf16(
+                record[start..start + length * 2]
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
+            )
+            .map(|value| value.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
+        })
+    } else {
+        None
+    };
     Some(ParsedRecord {
         parent_id,
         name,
         is_directory,
-        is_reparse: has_reparse_attribute || file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        is_reparse,
         logical_bytes,
         allocated_bytes,
     })
@@ -765,5 +778,32 @@ mod tests {
         let parsed = parse_record(&record).expect("record should parse");
         assert!(parsed.is_directory);
         assert!(parsed.is_reparse);
+        assert_eq!(parsed.name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn skips_file_name_allocation_for_regular_files() {
+        let mut record = vec![0_u8; 192];
+        record[..4].copy_from_slice(b"FILE");
+        record[20..22].copy_from_slice(&48_u16.to_le_bytes());
+        record[22..24].copy_from_slice(&1_u16.to_le_bytes());
+
+        let file_name = 48;
+        record[file_name..file_name + 4].copy_from_slice(&0x30_u32.to_le_bytes());
+        record[file_name + 4..file_name + 8].copy_from_slice(&96_u32.to_le_bytes());
+        record[file_name + 16..file_name + 20].copy_from_slice(&68_u32.to_le_bytes());
+        record[file_name + 20..file_name + 22].copy_from_slice(&24_u16.to_le_bytes());
+        record[file_name + 24..file_name + 32].copy_from_slice(&42_i64.to_le_bytes());
+        record[file_name + 24 + 64] = 1;
+        record[file_name + 24 + 65] = 1;
+        record[file_name + 24 + 66..file_name + 24 + 68]
+            .copy_from_slice(&u16::from(b'x').to_le_bytes());
+        record[file_name + 96..file_name + 100].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let parsed = parse_record(&record).expect("record should parse");
+        assert_eq!(parsed.parent_id, 42);
+        assert!(!parsed.is_directory);
+        assert!(!parsed.is_reparse);
+        assert_eq!(parsed.name, None);
     }
 }

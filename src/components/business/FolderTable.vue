@@ -248,7 +248,7 @@ table {
 
 th {
   position: sticky;
-  z-index: 1;
+  z-index: 10;
   top: 0;
   height: 34px;
   padding: 0 var(--space-3);
@@ -277,11 +277,11 @@ th button {
 }
 
 .folder-column-width {
-  width: 42%;
+  width: 48%;
 }
 
 .usage-column-width {
-  width: 24%;
+  width: 18%;
 }
 
 .count-column-width {

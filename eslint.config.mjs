@@ -5,7 +5,14 @@ import vue from "eslint-plugin-vue";
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "node_modules/**", "src-tauri/target/**", "bin/**", "obj/**"],
+    ignores: [
+      "artifacts/**",
+      "dist/**",
+      "node_modules/**",
+      "src-tauri/target/**",
+      "bin/**",
+      "obj/**",
+    ],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,

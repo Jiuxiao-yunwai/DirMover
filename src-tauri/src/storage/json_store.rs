@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, AppResult},
-    models::{AppSettings, LinkRow, MoveRecord},
+    models::{AppSettings, LinkRecord, LinkRow, MoveRecord},
     platform,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -116,15 +116,16 @@ impl Storage {
 
     pub fn load_links(&self) -> AppResult<Vec<LinkRow>> {
         let _guard = self.lock()?;
-        read_json_or_default(&self.paths.links, "链接记录")
+        let records: Vec<LinkRecord> = read_json_or_default(&self.paths.links, "链接记录")?;
+        Ok(records.into_iter().map(LinkRow::from).collect())
     }
 
     pub fn replace_links_for_root(&self, root: &Path, links: &[LinkRow]) -> AppResult<()> {
         let _guard = self.lock()?;
-        let mut records: Vec<LinkRow> = read_json_or_default(&self.paths.links, "链接记录")?;
+        let mut records: Vec<LinkRecord> = read_json_or_default(&self.paths.links, "链接记录")?;
         let root = normalized_path(root);
         records.retain(|link| normalized_text(&link.scan_root) != root);
-        records.extend_from_slice(links);
+        records.extend(links.iter().cloned().map(LinkRecord::from));
         write_json_atomic(&self.paths.links, &records)
     }
 

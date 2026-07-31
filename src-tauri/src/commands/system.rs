@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, AppResult},
-    models::{AppSettings, BootstrapData, MigrationPlan},
+    models::{AppSettings, AppSettingsDto, BootstrapData, MigrationPlan},
     platform,
     services::{migration, storage_planner},
     state::AppState,
@@ -39,10 +39,12 @@ pub async fn get_bootstrap_data(state: State<'_, AppState>) -> AppResult<Bootstr
             links,
             is_administrator: platform::is_administrator(),
             default_scan_root: storage_planner::default_scan_root(),
+            scan_presets: storage_planner::scan_presets(),
+            startup_scan_root: startup_scan_root(),
             automatic_managed_root: storage_planner::automatic_managed_root()
                 .map(|path| path.to_string_lossy().into_owned()),
             data_directory: state.storage().paths().root.to_string_lossy().into_owned(),
-            settings,
+            settings: settings.into(),
         })
     })
     .await
@@ -51,9 +53,10 @@ pub async fn get_bootstrap_data(state: State<'_, AppState>) -> AppResult<Bootstr
 
 #[tauri::command]
 pub async fn save_settings(
-    settings: AppSettings,
+    settings: AppSettingsDto,
     state: State<'_, AppState>,
 ) -> AppResult<BootstrapData> {
+    let settings = AppSettings::from(settings);
     for root in settings
         .managed_root
         .iter()
@@ -131,9 +134,41 @@ pub fn open_path(path: String, select: bool) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub fn request_elevation() -> AppResult<bool> {
+pub fn open_managed_root(state: State<'_, AppState>) -> AppResult<()> {
+    let settings = state.storage().load_settings()?;
+    let root = settings
+        .managed_root
+        .map(PathBuf::from)
+        .or_else(storage_planner::automatic_managed_root)
+        .ok_or_else(|| AppError::InvalidInput("当前没有可用的其他固定 NTFS 分区。".to_string()))?;
+    storage_planner::validate_managed_root(&root, None)?;
+    std::fs::create_dir_all(&root)?;
+    platform::open_in_file_manager(&root, false)
+}
+
+#[tauri::command]
+pub fn request_elevation(scan_root: Option<String>) -> AppResult<bool> {
     if platform::is_administrator() {
         return Ok(false);
     }
-    platform::relaunch_elevated(&[])
+    let arguments = if let Some(root) = scan_root {
+        let path = PathBuf::from(&root);
+        if !path.is_dir() {
+            return Err(AppError::InvalidInput("提权扫描目录不存在。".to_string()));
+        }
+        vec!["--scan".to_string(), root]
+    } else {
+        Vec::new()
+    };
+    platform::relaunch_elevated(&arguments)
+}
+
+fn startup_scan_root() -> Option<String> {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    arguments
+        .iter()
+        .position(|argument| argument == "--scan")
+        .and_then(|index| arguments.get(index + 1))
+        .filter(|path| Path::new(path).is_dir())
+        .cloned()
 }

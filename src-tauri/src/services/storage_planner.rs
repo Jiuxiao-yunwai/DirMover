@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, AppResult},
-    models::{AppSettings, ManagedCategory, ManagedCategoryRow},
+    models::{AppSettings, ManagedCategory, ManagedCategoryRow, ScanPreset},
     platform,
 };
 use std::path::{Component, Path, PathBuf};
@@ -65,6 +65,43 @@ pub fn default_scan_root() -> String {
     environment_path("LOCALAPPDATA")
         .or_else(|| environment_path("USERPROFILE"))
         .unwrap_or_default()
+}
+
+pub fn scan_presets() -> Vec<ScanPreset> {
+    [
+        ("local", "AppData Local", environment_path("LOCALAPPDATA")),
+        ("roaming", "AppData Roaming", environment_path("APPDATA")),
+        (
+            "localLow",
+            "AppData LocalLow",
+            environment_path("USERPROFILE").map(|profile| {
+                Path::new(&profile)
+                    .join("AppData")
+                    .join("LocalLow")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+        ),
+        (
+            "programFiles",
+            "Program Files",
+            environment_path("PROGRAMFILES"),
+        ),
+        (
+            "programFilesX86",
+            "Program Files (x86)",
+            environment_path("PROGRAMFILES(X86)"),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(key, label, path)| {
+        path.map(|path| ScanPreset {
+            key: key.to_string(),
+            label: label.to_string(),
+            path,
+        })
+    })
+    .collect()
 }
 
 pub fn automatic_managed_root() -> Option<PathBuf> {

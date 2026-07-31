@@ -8,8 +8,11 @@ pub mod task;
 
 pub use migration::{MoveRecord, MoveRow};
 pub use scan::{
-    FolderRow, LinkRow, ScanPage, ScanProgress, ScanQuery, ScanSnapshot, SortDirection, SortField,
+    FolderRow, LinkRecord, LinkRow, ScanPage, ScanProgress, ScanQuery, ScanSnapshot, SortDirection,
+    SortField,
 };
-pub use settings::{AppSettings, ManagedCategory, ManagedCategoryRow, MigrationPlan};
-pub use system::{BootstrapData, DriveInfo};
+pub use settings::{
+    AppSettings, AppSettingsDto, ManagedCategory, ManagedCategoryRow, MigrationPlan,
+};
+pub use system::{BootstrapData, DriveInfo, ScanPreset};
 pub use task::{TaskDescriptor, TaskEvent, TaskKind, TaskState};

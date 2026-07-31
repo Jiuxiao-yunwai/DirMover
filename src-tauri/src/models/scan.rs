@@ -20,7 +20,7 @@ pub struct FolderRow {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
-pub struct LinkRow {
+pub struct LinkRecord {
     pub kind: String,
     pub path: String,
     pub target: String,
@@ -29,6 +29,43 @@ pub struct LinkRow {
     pub scan_root: String,
     #[serde(default)]
     pub detected_at_utc: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRow {
+    pub kind: String,
+    pub path: String,
+    pub target: String,
+    pub state: String,
+    pub scan_root: String,
+    pub detected_at_utc: Option<DateTime<Utc>>,
+}
+
+impl From<LinkRecord> for LinkRow {
+    fn from(record: LinkRecord) -> Self {
+        Self {
+            kind: record.kind,
+            path: record.path,
+            target: record.target,
+            state: record.state,
+            scan_root: record.scan_root,
+            detected_at_utc: record.detected_at_utc,
+        }
+    }
+}
+
+impl From<LinkRow> for LinkRecord {
+    fn from(row: LinkRow) -> Self {
+        Self {
+            kind: row.kind,
+            path: row.path,
+            target: row.target,
+            state: row.state,
+            scan_root: row.scan_root,
+            detected_at_utc: row.detected_at_utc,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +126,28 @@ impl Default for ScanQuery {
             sort_field: SortField::default(),
             sort_direction: SortDirection::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinkRecord, LinkRow};
+
+    #[test]
+    fn separates_legacy_link_storage_from_camel_case_ipc() {
+        let legacy = r#"{
+          "Kind":"目录联接",
+          "Path":"C:\\source",
+          "Target":"D:\\target",
+          "State":"有效",
+          "ScanRoot":"C:\\",
+          "DetectedAtUtc":null
+        }"#;
+        let record: LinkRecord = serde_json::from_str(legacy).expect("legacy link should parse");
+        let row = LinkRow::from(record);
+        let value = serde_json::to_value(row).expect("IPC row should serialize");
+        assert_eq!(value["path"], r"C:\source");
+        assert!(value.get("Path").is_none());
     }
 }
 

@@ -19,6 +19,7 @@ pub fn run() {
             commands::system::save_settings,
             commands::system::plan_migration,
             commands::system::open_path,
+            commands::system::open_managed_root,
             commands::system::request_elevation,
             commands::scan::list_child_folders,
             commands::scan::start_scan,

@@ -142,7 +142,6 @@ const openManagedRoot = async (): Promise<void> => {
         >
           清除分类独立设置
         </BaseButton>
-        <span>设置继续保存在 {{ bootstrap.dataDirectory }}</span>
       </footer>
     </section>
   </section>
@@ -164,13 +163,6 @@ const openManagedRoot = async (): Promise<void> => {
 h1 {
   font-size: var(--font-size-title);
   font-weight: 650;
-}
-
-.page-header p,
-.settings-section header p,
-.settings-section footer span {
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
 }
 
 .warning-strip {

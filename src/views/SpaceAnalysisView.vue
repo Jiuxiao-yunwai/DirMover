@@ -60,8 +60,6 @@ const totalLogical = computed(() =>
 const totalAllocated = computed(() =>
   scanPage.value ? formatBytes(scanPage.value.totalAllocatedBytes) : "未扫描",
 );
-const engineLabel = computed(() => scanPage.value?.engine ?? "目录预览");
-
 const currentPreset = computed(() => {
   const match = props.bootstrap.scanPresets.find(
     (preset) => preset.path.toLowerCase() === root.value.toLowerCase(),
@@ -316,7 +314,6 @@ const notifyError = (error: unknown): void => {
   <section class="view">
     <header class="page-header">
       <h1>空间分析</h1>
-      <span class="engine-badge">{{ engineLabel }}</span>
     </header>
 
     <div class="toolbar">
@@ -496,21 +493,6 @@ const notifyError = (error: unknown): void => {
 .page-header h1 {
   font-size: var(--font-size-title);
   font-weight: 650;
-}
-
-.page-header p {
-  margin-top: 2px;
-  color: var(--text-secondary);
-  font-size: var(--font-size-small);
-}
-
-.engine-badge {
-  padding: 3px var(--space-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-small);
-  color: var(--text-secondary);
-  background: var(--surface-secondary);
-  font-size: 11px;
 }
 
 .toolbar {

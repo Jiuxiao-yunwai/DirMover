@@ -2,6 +2,14 @@
 bin/
 obj/
 
+# Frontend and Tauri build output
+node_modules/
+.npm-cache/
+dist/
+src-tauri/target/
+src-tauri/gen/
+npm-debug.log*
+
 # Local SDK state
 .dotnet-cli/
 
@@ -19,3 +27,7 @@ DirMover-win-x64/
 DirMover-win-x64-update/
 DirMover-win-x64-*/
 DirMover-win-x64.zip
+
+# Local runtime data and screenshots
+.dirmover-dev/
+artifacts/

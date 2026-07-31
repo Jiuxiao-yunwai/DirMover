@@ -1,0 +1,9 @@
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+::selection {
+  color: var(--text-primary);
+  background: var(--accent-subtle);
+}

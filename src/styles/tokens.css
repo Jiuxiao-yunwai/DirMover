@@ -1,0 +1,41 @@
+:root {
+  color-scheme: light;
+  font-family:
+    "Segoe UI Variable",
+    "Segoe UI",
+    "Microsoft YaHei UI",
+    system-ui,
+    sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+
+  --font-family: inherit;
+  --font-size-small: 12px;
+  --font-size-body: 14px;
+  --font-size-title: 19px;
+  --font-size-heading: 15px;
+  --line-height-body: 1.5;
+
+  --radius-small: 4px;
+  --radius-medium: 7px;
+  --radius-large: 10px;
+
+  --control-height-small: 28px;
+  --control-height: 34px;
+  --control-height-large: 40px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  --duration-fast: 120ms;
+  --duration-normal: 180ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  --sidebar-width: 208px;
+  --header-height: 68px;
+  --status-height: 32px;
+}

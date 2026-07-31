@@ -62,5 +62,6 @@ npm run tauri -- build
 ```
 
 构建完成后，可执行文件位于 `src-tauri\target\release\dirmover.exe`，安装包位于 `src-tauri\target\release\bundle\`。
+Windows 的 NSIS 与 MSI 安装界面固定使用简体中文。
 
 更多设计说明见 [架构文档](docs/architecture.md)。

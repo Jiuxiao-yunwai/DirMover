@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WixLocalization
+  Culture="zh-CN"
+  xmlns="http://schemas.microsoft.com/wix/2006/localization"
+>
+  <String Id="LaunchApp">启动 DirMover</String>
+  <String Id="DowngradeErrorMessage">
+    已安装更新版本的 DirMover，无法安装当前旧版本。
+  </String>
+  <String Id="PathEnvVarFeature">
+    将 DirMover 的安装目录添加到 PATH 系统环境变量，以便从任意位置启动 DirMover。
+  </String>
+  <String Id="InstallAppFeature">安装 DirMover。</String>
+</WixLocalization>

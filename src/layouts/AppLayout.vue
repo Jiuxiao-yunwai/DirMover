@@ -41,6 +41,17 @@ watch(collapsed, (value) => {
         <div class="brand-copy">
           <strong>DirMover</strong>
         </div>
+        <button
+          class="collapse-toggle"
+          type="button"
+          :title="collapsed ? '展开菜单' : '折叠菜单'"
+          :aria-label="collapsed ? '展开菜单' : '折叠菜单'"
+          @click="collapsed = !collapsed"
+        >
+          <span aria-hidden="true" />
+          <span aria-hidden="true" />
+          <span aria-hidden="true" />
+        </button>
       </div>
 
       <nav aria-label="主导航">
@@ -79,16 +90,6 @@ watch(collapsed, (value) => {
           <span class="state-dot" :class="{ admin: isAdministrator }" />
           {{ isAdministrator ? "管理员模式 · MFT 可用" : "普通模式 · 扫描时提权" }}
         </div>
-        <button
-          class="collapse-toggle"
-          type="button"
-          :title="collapsed ? '展开菜单' : '折叠菜单'"
-          :aria-label="collapsed ? '展开菜单' : '折叠菜单'"
-          @click="collapsed = !collapsed"
-        >
-          <span aria-hidden="true">{{ collapsed ? "›" : "‹" }}</span>
-          <strong>{{ collapsed ? "" : "折叠菜单" }}</strong>
-        </button>
       </div>
     </aside>
 
@@ -118,7 +119,7 @@ watch(collapsed, (value) => {
 }
 
 .app-layout.collapsed {
-  grid-template-columns: 64px minmax(0, 1fr);
+  grid-template-columns: 88px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -139,7 +140,7 @@ watch(collapsed, (value) => {
 }
 
 .collapsed .brand {
-  justify-content: center;
+  gap: var(--space-1);
   padding-inline: 0;
 }
 
@@ -157,6 +158,8 @@ watch(collapsed, (value) => {
 
 .brand-copy {
   display: grid;
+  min-width: 0;
+  flex: 1;
 }
 
 .brand strong {
@@ -253,11 +256,13 @@ select {
 }
 
 .collapse-toggle {
-  display: flex;
-  min-height: 32px;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  align-content: center;
+  gap: 3px;
+  padding: 6px;
   border-radius: var(--radius-small);
   color: var(--text-secondary);
   background: transparent;
@@ -269,17 +274,15 @@ select {
 }
 
 .collapse-toggle span {
-  font-size: 20px;
-  line-height: 1;
-}
-
-.collapse-toggle strong {
-  font-size: 11px;
-  font-weight: 500;
+  display: block;
+  width: 16px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: currentColor;
 }
 
 .collapsed .sidebar-footer {
-  padding-inline: 0;
+  display: none;
 }
 
 .state-dot,

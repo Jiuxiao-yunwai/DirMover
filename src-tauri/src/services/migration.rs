@@ -260,17 +260,34 @@ pub fn recover_interrupted(storage: &Storage, record_id: Uuid) -> AppResult<Stri
     let destination = PathBuf::from(&record.destination);
 
     let staging = restore_staging_path(&source, record.id);
-    if staging.exists() && is_active(&record) {
-        fs::remove_dir_all(staging)?;
-        record.stage = ACTIVE.to_string();
-        storage.update_move(&record)?;
-        return Ok("已清理中断的还原暂存目录，原目录联接保持有效。".to_string());
+    if staging.exists() {
+        if is_active(&record) {
+            fs::remove_dir_all(staging)?;
+            record.stage = ACTIVE.to_string();
+            storage.update_move(&record)?;
+            return Ok("已清理中断的还原暂存目录，原目录联接保持有效。".to_string());
+        }
+        if !source.exists() && destination.exists() {
+            fs::rename(&staging, &source)?;
+            record.stage = RESTORED.to_string();
+            storage.update_move(&record)?;
+            return Ok(format!(
+                "已完成中断的还原切换；目标副本仍保留在 {}，确认原位置后可手动清理。",
+                destination.to_string_lossy()
+            ));
+        }
     }
 
     if is_active(&record) {
+        if let Some(backup) = record.backup_path.as_deref().map(PathBuf::from)
+            && backup.exists()
+        {
+            fs::remove_dir_all(backup)?;
+            record.backup_path = None;
+        }
         record.stage = ACTIVE.to_string();
         storage.update_move(&record)?;
-        return Ok("目录联接有效，迁移记录已恢复为正常状态。".to_string());
+        return Ok("目录联接有效，遗留备份已清理，迁移记录已恢复为正常状态。".to_string());
     }
 
     if let Some(backup) = record.backup_path.as_deref().map(PathBuf::from)

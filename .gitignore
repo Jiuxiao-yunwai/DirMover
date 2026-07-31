@@ -1,6 +1,10 @@
-# .NET build output
+# Legacy build output retained outside the source tree
 bin/
 obj/
+DirMover-win-x64/
+DirMover-win-x64-update/
+DirMover-win-x64-*/
+DirMover-win-x64.zip
 
 # Frontend and Tauri build output
 node_modules/
@@ -21,12 +25,6 @@ npm-debug.log*
 # Codex workspace metadata
 .agents/
 .codex/
-
-# Published binaries and archives
-DirMover-win-x64/
-DirMover-win-x64-update/
-DirMover-win-x64-*/
-DirMover-win-x64.zip
 
 # Local runtime data and screenshots
 .dirmover-dev/

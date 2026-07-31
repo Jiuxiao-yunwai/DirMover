@@ -267,6 +267,7 @@ th button {
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
+  white-space: nowrap;
   color: inherit;
   background: transparent;
   text-align: inherit;
@@ -281,7 +282,7 @@ th button {
 }
 
 .usage-column-width {
-  width: 10ch;
+  width: 12ch;
 }
 
 .count-column-width {

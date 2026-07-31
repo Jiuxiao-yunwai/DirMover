@@ -146,8 +146,6 @@ watch(collapsed, (value) => {
   border-right: 1px solid var(--border-subtle);
   background: var(--surface-sidebar);
   contain: layout paint;
-  transition: width var(--duration-normal) var(--ease-standard);
-  will-change: width;
 }
 
 .collapsed .sidebar {
@@ -215,9 +213,6 @@ watch(collapsed, (value) => {
   overflow: hidden;
   opacity: 1;
   transform: translateX(0);
-  transition:
-    opacity var(--duration-fast) var(--ease-standard),
-    transform var(--duration-normal) var(--ease-standard);
 }
 
 .brand strong {
@@ -288,7 +283,6 @@ nav button {
   text-align: left;
   white-space: nowrap;
   transition:
-    padding var(--duration-normal) var(--ease-standard),
     background var(--duration-fast) var(--ease-standard),
     color var(--duration-fast) var(--ease-standard);
 }
@@ -333,9 +327,6 @@ nav button.active .nav-icon {
   overflow: hidden;
   opacity: 1;
   transform: translateX(0);
-  transition:
-    opacity var(--duration-fast) var(--ease-standard),
-    transform var(--duration-normal) var(--ease-standard);
 }
 
 .collapsed .nav-label {
@@ -385,13 +376,7 @@ select {
   background: transparent;
   opacity: 1;
   transform: scale(1);
-  transition:
-    width var(--duration-normal) var(--ease-standard),
-    flex-basis var(--duration-normal) var(--ease-standard),
-    padding var(--duration-normal) var(--ease-standard),
-    opacity var(--duration-fast) var(--ease-standard),
-    transform var(--duration-fast) var(--ease-standard),
-    background var(--duration-fast) var(--ease-standard);
+  transition: background var(--duration-fast) var(--ease-standard);
 }
 
 .collapse-toggle:hover {

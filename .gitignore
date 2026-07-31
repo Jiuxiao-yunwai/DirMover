@@ -1,0 +1,21 @@
+# .NET build output
+bin/
+obj/
+
+# Local SDK state
+.dotnet-cli/
+
+# IDE and user-specific files
+.vs/
+*.user
+*.suo
+
+# Codex workspace metadata
+.agents/
+.codex/
+
+# Published binaries and archives
+DirMover-win-x64/
+DirMover-win-x64-update/
+DirMover-win-x64-*/
+DirMover-win-x64.zip

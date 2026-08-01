@@ -33,6 +33,7 @@ pub async fn get_bootstrap_data(state: State<'_, AppState>) -> AppResult<Bootstr
         let mut links = state.storage().load_links()?;
         links.sort_by(|left, right| right.detected_at_utc.cmp(&left.detected_at_utc));
         Ok(BootstrapData {
+            version: env!("CARGO_PKG_VERSION").to_string(),
             managed_locations: storage_planner::managed_locations(&settings),
             drives: platform::fixed_ntfs_drives(),
             moves: migration::move_rows(state.storage())?,

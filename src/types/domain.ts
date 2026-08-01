@@ -65,6 +65,7 @@ export type FolderRow = {
 };
 
 export type BootstrapData = {
+  version: string;
   settings: AppSettings;
   managedLocations: ManagedCategoryRow[];
   drives: DriveInfo[];
@@ -86,6 +87,11 @@ export type MigrationPlan = {
   destination: string | null;
   available: boolean;
   reason: string | null;
+};
+
+export type MigrationRequest = {
+  source: string;
+  destination: string;
 };
 
 export type SortField =
@@ -119,7 +125,7 @@ export type ScanPage = {
 };
 
 export type TaskKind = "scan" | "migration" | "restore";
-export type TaskState = "running" | "completed" | "failed" | "cancelled";
+export type TaskState = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export type TaskDescriptor = {
   id: string;

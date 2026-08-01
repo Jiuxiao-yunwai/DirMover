@@ -7,9 +7,15 @@ use std::{
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
+/// Returns true if the given file attributes bitmask indicates a reparse point.
+/// Use this to avoid a second symlink_metadata call when you already have metadata.
+pub fn is_reparse_point_from_attributes(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 pub fn is_reparse_point(path: &Path) -> AppResult<bool> {
     let metadata = fs::symlink_metadata(path)?;
-    Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+    Ok(is_reparse_point_from_attributes(metadata.file_attributes()))
 }
 
 pub fn link_target(path: &Path) -> AppResult<Option<PathBuf>> {

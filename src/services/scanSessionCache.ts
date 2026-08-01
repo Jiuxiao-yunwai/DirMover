@@ -37,5 +37,9 @@ export const createScanSessionCache = (capacity = 8) => {
         entries.delete(oldest);
       }
     },
+
+    clear(): void {
+      entries.clear();
+    },
   };
 };

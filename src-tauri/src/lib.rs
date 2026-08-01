@@ -28,6 +28,7 @@ pub fn run() {
             commands::scan::query_scan_result,
             commands::scan::detect_links,
             commands::migration::start_migration,
+            commands::migration::start_migrations,
             commands::migration::start_restore,
             commands::migration::recover_move,
             commands::migration::list_moves

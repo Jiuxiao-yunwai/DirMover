@@ -6,6 +6,7 @@ import type {
   FolderRow,
   LinkRow,
   MigrationPlan,
+  MigrationRequest,
   MoveRow,
   ScanPage,
   ScanQuery,
@@ -64,6 +65,18 @@ export const api = {
       { source, destination },
       onEvent,
     );
+  },
+
+  startMigrations(
+    requests: MigrationRequest[],
+    onEvent: (event: TaskEvent) => void,
+  ): Promise<TaskDescriptor[]> {
+    const channel = new Channel<TaskEvent>();
+    channel.onmessage = onEvent;
+    return invokeCommand<TaskDescriptor[]>("start_migrations", {
+      requests,
+      onEvent: channel,
+    });
   },
 
   startRestore(

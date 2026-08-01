@@ -2,6 +2,8 @@
 
 DirMover 是一个轻量、高性能的 Windows 目录空间分析与安全迁移工具，基于 **Tauri 2 + Rust + Vue 3 + TypeScript** 构建。Rust 负责 NTFS 扫描、文件迁移、目录联接和本地记录，Vue 负责响应式桌面界面。
 
+![应用截图](assets/image.png)
+
 ## 下载与安装
 
 前往 [Releases](https://github.com/Jiuxiao-yunwai/DirMover/releases/latest) 下载最新版本。当前仅提供 Windows x64 版本，建议使用 Windows 10 或 Windows 11。
@@ -62,6 +64,8 @@ Rust 存储层保留旧版 PascalCase JSON 结构；前端 IPC 使用独立的 c
 ## 本地开发
 
 需要 Node.js 20+、Rust 1.85+、Microsoft C++ Build Tools 与 WebView2。
+
+分支、开发版本号和正式发布流程见 [开发与发布规范](docs/development.md)。日常修改在 `develop` 完成，`main` 仅保存正式发布版本。
 
 ```powershell
 npm install

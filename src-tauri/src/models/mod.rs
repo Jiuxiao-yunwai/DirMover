@@ -6,7 +6,7 @@ pub mod settings;
 pub mod system;
 pub mod task;
 
-pub use migration::{MoveRecord, MoveRow};
+pub use migration::{MigrationRequest, MoveRecord, MoveRow};
 pub use scan::{
     FolderRow, LinkRecord, LinkRow, ScanPage, ScanProgress, ScanQuery, ScanSnapshot, SortDirection,
     SortField,

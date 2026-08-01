@@ -1,26 +1,40 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 import BaseContextMenu from "@/components/base/BaseContextMenu.vue";
 import EmptyState from "@/components/base/EmptyState.vue";
 import type { FolderRow, SortDirection, SortField } from "@/types/domain";
+import { normalizeColumnRatios, resizeColumnPair } from "@/utils/columnSizing";
 import { formatBytes, formatInteger } from "@/utils/format";
 
 const props = defineProps<{
   rows: FolderRow[];
-  selectedPath: string | null;
+  selectedPaths: string[];
   sortField: SortField;
   sortDirection: SortDirection;
   totalAllocatedBytes: number;
 }>();
 
 const emit = defineEmits<{
-  select: [row: FolderRow];
+  toggle: [row: FolderRow];
+  toggleAll: [];
   sort: [field: SortField];
   open: [row: FolderRow];
   copy: [row: FolderRow];
 }>();
 
 const menu = ref({ open: false, x: 0, y: 0, row: null as FolderRow | null });
+const table = ref<HTMLTableElement | null>(null);
+const columnRatios = ref<number[] | null>(null);
+const resizingColumn = ref<number | null>(null);
+const minimumColumnWidths = [36, 160, 104, 88, 112];
+let stopPointerResize: (() => void) | null = null;
+const selectedSet = computed(() => new Set(props.selectedPaths));
+const allSelected = computed(
+  () => props.rows.length > 0 && props.rows.every((row) => selectedSet.value.has(row.fullPath)),
+);
+const someSelected = computed(
+  () => !allSelected.value && props.rows.some((row) => selectedSet.value.has(row.fullPath)),
+);
 
 const allocatedPercentage = (row: FolderRow): number => {
   if (!row.measured || props.totalAllocatedBytes <= 0) return 0;
@@ -37,10 +51,72 @@ const percentageLabel = (row: FolderRow): string => {
 const sortClass = computed(() =>
   props.sortDirection === "ascending" ? "ascending" : "descending",
 );
+const columnStyle = (index: number): { width: string } | undefined => {
+  const ratio = columnRatios.value?.[index];
+  return ratio ? { width: `${ratio * 100}%` } : undefined;
+};
+
+const measureColumnWidths = (): number[] => {
+  const headers = table.value?.querySelectorAll("thead th");
+  return minimumColumnWidths.map((minimum, index) =>
+    Math.max(minimum, headers?.[index]?.getBoundingClientRect().width ?? minimum),
+  );
+};
+
+const resizedWidths = (initial: number[], index: number, requestedDelta: number): number[] => {
+  return resizeColumnPair(initial, minimumColumnWidths, index, requestedDelta);
+};
+
+const startResize = (event: PointerEvent, index: number): void => {
+  event.preventDefault();
+  event.stopPropagation();
+  stopPointerResize?.();
+  const initial = measureColumnWidths();
+  const startX = event.clientX;
+  columnRatios.value = normalizeColumnRatios(initial);
+  resizingColumn.value = index;
+  const previousCursor = document.body.style.cursor;
+  const previousUserSelect = document.body.style.userSelect;
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+
+  const move = (moveEvent: PointerEvent): void => {
+    columnRatios.value = normalizeColumnRatios(
+      resizedWidths(initial, index, moveEvent.clientX - startX),
+    );
+  };
+  const stop = (): void => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", stop);
+    window.removeEventListener("pointercancel", stop);
+    document.body.style.cursor = previousCursor;
+    document.body.style.userSelect = previousUserSelect;
+    resizingColumn.value = null;
+    stopPointerResize = null;
+  };
+  stopPointerResize = stop;
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", stop);
+  window.addEventListener("pointercancel", stop);
+};
+
+const resizeWithKeyboard = (index: number, delta: number): void => {
+  const initial = measureColumnWidths();
+  columnRatios.value = normalizeColumnRatios(resizedWidths(initial, index, delta));
+};
+
+const resetColumnWidths = (): void => {
+  stopPointerResize?.();
+  columnRatios.value = null;
+};
+
+onBeforeUnmount(() => {
+  stopPointerResize?.();
+});
 
 const showMenu = (event: MouseEvent, row: FolderRow): void => {
   event.preventDefault();
-  emit("select", row);
+  if (!selectedSet.value.has(row.fullPath)) emit("toggle", row);
   menu.value = {
     open: true,
     x: Math.min(event.clientX, window.innerWidth - 205),
@@ -59,15 +135,36 @@ const invokeMenu = (action: "open" | "copy"): void => {
 <template>
   <div class="table-shell">
     <div v-if="rows.length > 0" class="table-scroll">
-      <table>
+      <table ref="table" :class="{ resizing: resizingColumn !== null }">
         <colgroup>
-          <col class="folder-column-width" />
-          <col class="usage-column-width" />
-          <col class="count-column-width" />
-          <col class="status-column-width" />
+          <col class="selection-column-width" :style="columnStyle(0)" />
+          <col class="folder-column-width" :style="columnStyle(1)" />
+          <col class="usage-column-width" :style="columnStyle(2)" />
+          <col class="count-column-width" :style="columnStyle(3)" />
+          <col class="status-column-width" :style="columnStyle(4)" />
         </colgroup>
         <thead>
           <tr>
+            <th class="selection-column">
+              <input
+                type="checkbox"
+                aria-label="选择当前列表中的全部文件夹"
+                :checked="allSelected"
+                :indeterminate="someSelected"
+                @change="$emit('toggleAll')"
+              />
+              <span
+                class="resize-handle"
+                role="separator"
+                tabindex="0"
+                aria-label="调整选择列宽度"
+                title="拖动调整列宽；双击恢复默认"
+                @pointerdown="startResize($event, 0)"
+                @keydown.left.prevent="resizeWithKeyboard(0, -12)"
+                @keydown.right.prevent="resizeWithKeyboard(0, 12)"
+                @dblclick.stop="resetColumnWidths"
+              />
+            </th>
             <th
               class="align-left folder-column"
               :aria-sort="
@@ -87,6 +184,17 @@ const invokeMenu = (action: "open" | "copy"): void => {
                   aria-hidden="true"
                 />
               </button>
+              <span
+                class="resize-handle"
+                role="separator"
+                tabindex="0"
+                aria-label="调整文件夹列宽度"
+                title="拖动调整列宽；双击恢复默认"
+                @pointerdown="startResize($event, 1)"
+                @keydown.left.prevent="resizeWithKeyboard(1, -12)"
+                @keydown.right.prevent="resizeWithKeyboard(1, 12)"
+                @dblclick.stop="resetColumnWidths"
+              />
             </th>
             <th
               :aria-sort="
@@ -106,6 +214,17 @@ const invokeMenu = (action: "open" | "copy"): void => {
                   aria-hidden="true"
                 />
               </button>
+              <span
+                class="resize-handle"
+                role="separator"
+                tabindex="0"
+                aria-label="调整磁盘占用列宽度"
+                title="拖动调整列宽；双击恢复默认"
+                @pointerdown="startResize($event, 2)"
+                @keydown.left.prevent="resizeWithKeyboard(2, -12)"
+                @keydown.right.prevent="resizeWithKeyboard(2, 12)"
+                @dblclick.stop="resetColumnWidths"
+              />
             </th>
             <th
               :aria-sort="
@@ -125,6 +244,17 @@ const invokeMenu = (action: "open" | "copy"): void => {
                   aria-hidden="true"
                 />
               </button>
+              <span
+                class="resize-handle"
+                role="separator"
+                tabindex="0"
+                aria-label="调整文件数列宽度"
+                title="拖动调整列宽；双击恢复默认"
+                @pointerdown="startResize($event, 3)"
+                @keydown.left.prevent="resizeWithKeyboard(3, -12)"
+                @keydown.right.prevent="resizeWithKeyboard(3, 12)"
+                @dblclick.stop="resetColumnWidths"
+              />
             </th>
             <th
               :aria-sort="
@@ -144,6 +274,17 @@ const invokeMenu = (action: "open" | "copy"): void => {
                   aria-hidden="true"
                 />
               </button>
+              <span
+                class="resize-handle"
+                role="separator"
+                tabindex="0"
+                aria-label="调整状态列宽度"
+                title="拖动调整列宽；双击恢复默认"
+                @pointerdown="startResize($event, 4)"
+                @keydown.left.prevent="resizeWithKeyboard(4, -12)"
+                @keydown.right.prevent="resizeWithKeyboard(4, 12)"
+                @dblclick.stop="resetColumnWidths"
+              />
             </th>
           </tr>
         </thead>
@@ -152,14 +293,22 @@ const invokeMenu = (action: "open" | "copy"): void => {
             v-for="row in rows"
             :key="row.fullPath"
             data-app-context-menu
-            :class="{ selected: selectedPath === row.fullPath }"
+            :class="{ selected: selectedSet.has(row.fullPath) }"
             tabindex="0"
-            @click="$emit('select', row)"
+            @click="$emit('toggle', row)"
             @dblclick="$emit('open', row)"
             @contextmenu="showMenu($event, row)"
             @keydown.enter="$emit('open', row)"
-            @keydown.space.prevent="$emit('select', row)"
+            @keydown.space.prevent="$emit('toggle', row)"
           >
+            <td class="selection-cell">
+              <input
+                type="checkbox"
+                :checked="selectedSet.has(row.fullPath)"
+                :aria-label="`选择 ${row.name}`"
+                @click.stop="$emit('toggle', row)"
+              />
+            </td>
             <td class="align-left folder-name" :title="row.fullPath">
               <span class="row-marker" :class="{ linked: row.isLink }" />
               {{ row.name }}
@@ -236,7 +385,8 @@ const invokeMenu = (action: "open" | "copy"): void => {
 }
 
 .table-scroll {
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 table {
@@ -271,6 +421,56 @@ th button {
   color: inherit;
   background: transparent;
   text-align: inherit;
+}
+
+.resize-handle {
+  position: absolute;
+  z-index: 12;
+  top: 0;
+  right: -5px;
+  width: 10px;
+  height: 100%;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.resize-handle::after {
+  position: absolute;
+  top: 7px;
+  right: 4px;
+  bottom: 7px;
+  width: 2px;
+  border-radius: 1px;
+  background: transparent;
+  content: "";
+}
+
+.resize-handle:hover::after,
+.resize-handle:focus-visible::after,
+.resizing .resize-handle::after {
+  background: var(--accent);
+}
+
+.resize-handle:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.selection-column-width {
+  width: 42px;
+}
+
+.selection-column,
+.selection-cell {
+  padding: 0;
+  text-align: center;
+}
+
+.selection-column input,
+.selection-cell input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
 }
 
 .folder-column button {

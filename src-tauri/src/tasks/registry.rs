@@ -62,10 +62,29 @@ impl TaskRegistry {
         phase: impl Into<String>,
         message: impl Into<String>,
     ) -> AppResult<(TaskDescriptor, CancellationFlag)> {
+        self.start_with_state(kind, TaskState::Running, phase, message)
+    }
+
+    pub fn start_queued(
+        &self,
+        kind: TaskKind,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) -> AppResult<(TaskDescriptor, CancellationFlag)> {
+        self.start_with_state(kind, TaskState::Queued, phase, message)
+    }
+
+    fn start_with_state(
+        &self,
+        kind: TaskKind,
+        state: TaskState,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) -> AppResult<(TaskDescriptor, CancellationFlag)> {
         let descriptor = TaskDescriptor {
             id: Uuid::new_v4(),
             kind,
-            state: TaskState::Running,
+            state,
             percentage: 0,
             phase: phase.into(),
             message: message.into(),
@@ -89,6 +108,43 @@ impl TaskRegistry {
             },
         );
         Ok((descriptor, cancellation))
+    }
+
+    pub fn mark_running(
+        &self,
+        id: Uuid,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) -> AppResult<TaskDescriptor> {
+        let mut inner = self.lock()?;
+        let entry = inner
+            .entries
+            .get_mut(&id)
+            .ok_or_else(|| AppError::NotFound("找不到指定任务。".to_string()))?;
+        if entry.descriptor.state == TaskState::Queued {
+            entry.descriptor.state = TaskState::Running;
+            entry.descriptor.phase = phase.into();
+            entry.descriptor.message = message.into();
+        }
+        Ok(entry.descriptor.clone())
+    }
+
+    pub fn update_queued(
+        &self,
+        id: Uuid,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) -> AppResult<TaskDescriptor> {
+        let mut inner = self.lock()?;
+        let entry = inner
+            .entries
+            .get_mut(&id)
+            .ok_or_else(|| AppError::NotFound("找不到指定任务。".to_string()))?;
+        if entry.descriptor.state == TaskState::Queued {
+            entry.descriptor.phase = phase.into();
+            entry.descriptor.message = message.into();
+        }
+        Ok(entry.descriptor.clone())
     }
 
     pub fn update(
@@ -130,13 +186,20 @@ impl TaskRegistry {
     }
 
     pub fn cancel(&self, id: Uuid) -> AppResult<TaskDescriptor> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
         let entry = inner
             .entries
-            .get(&id)
+            .get_mut(&id)
             .ok_or_else(|| AppError::NotFound("找不到指定任务。".to_string()))?;
-        if entry.descriptor.state == TaskState::Running {
-            entry.cancellation.cancel();
+        match entry.descriptor.state {
+            TaskState::Queued => {
+                entry.cancellation.cancel();
+                entry.descriptor.state = TaskState::Cancelled;
+                entry.descriptor.message = "排队任务已取消。".to_string();
+                entry.descriptor.finished_at_utc = Some(Utc::now());
+            }
+            TaskState::Running => entry.cancellation.cancel(),
+            _ => {}
         }
         Ok(entry.descriptor.clone())
     }
@@ -194,6 +257,18 @@ mod tests {
         registry.cancel(task.id).expect("task should cancel");
         assert!(flag.is_cancelled());
         let cancelled = registry.cancelled(task.id).expect("state should update");
+        assert_eq!(cancelled.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn queued_task_can_be_cancelled_before_it_starts() {
+        let registry = TaskRegistry::default();
+        let (task, flag) = registry
+            .start_queued(TaskKind::Migration, "queued", "排队中")
+            .expect("task should queue");
+        assert_eq!(task.state, TaskState::Queued);
+        let cancelled = registry.cancel(task.id).expect("task should cancel");
+        assert!(flag.is_cancelled());
         assert_eq!(cancelled.state, TaskState::Cancelled);
     }
 }

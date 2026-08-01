@@ -33,7 +33,9 @@ watch(
   },
 );
 
-const busy = computed(() => activeTask.value?.state === "running");
+const busy = computed(() =>
+  ["queued", "running"].includes(activeTask.value?.state ?? ""),
+);
 
 const refresh = async (): Promise<void> => {
   emit("busy", true);
@@ -175,7 +177,7 @@ const notifyError = (error: unknown): void => {
       <BaseButton v-if="busy" @click="cancel">停止</BaseButton>
     </div>
 
-    <div v-if="activeTask?.state === 'running'" class="task-progress">
+    <div v-if="activeTask?.state === 'queued' || activeTask?.state === 'running'" class="task-progress">
       <div>
         <span>{{ activeTask.message }}</span>
         <strong>{{ activeTask.percentage }}%</strong>

@@ -2,6 +2,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationRequest {
+    pub source: String,
+    pub destination: String,
+}
+
 pub mod stage {
     pub const PREPARING: &str = "Preparing";
     pub const CUTOVER_PLANNED: &str = "CutoverPlanned";

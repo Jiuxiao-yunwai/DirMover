@@ -14,7 +14,7 @@ Current development cycle:
 
 - Stable version on `main`: `2.1.2`
 - Development branch: `develop`
-- Current development version: `2.2.0-dev.1`
+- Current development version: `2.2.0-dev.7`
 - Target release: `2.2.0`
 
 See `docs/development.md` for the full branch, version, and release workflow.

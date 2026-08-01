@@ -1,22 +1,42 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import BaseButton from "@/components/base/BaseButton.vue";
 import BaseDialog from "@/components/base/BaseDialog.vue";
 import type { MigrationPlan } from "@/types/domain";
 
-defineProps<{
+const props = defineProps<{
   open: boolean;
-  source: string;
+  sources: string[];
   mode: "managed" | "custom";
-  managedPlan: MigrationPlan | null;
-  customPlan: MigrationPlan | null;
+  managedPlans: MigrationPlan[];
+  customPlans: MigrationPlan[];
   busy: boolean;
 }>();
+
+const activePlans = computed(() =>
+  props.mode === "managed" ? props.managedPlans : props.customPlans,
+);
+const managedAvailable = computed(
+  () => props.managedPlans.length > 0 && props.managedPlans.every((plan) => plan.available),
+);
+const customAvailable = computed(
+  () => props.customPlans.length > 0 && props.customPlans.every((plan) => plan.available),
+);
+const managedRoots = computed(() => [
+  ...new Set(props.managedPlans.map((plan) => plan.managedRoot).filter(Boolean)),
+]);
+const firstManagedReason = computed(
+  () => props.managedPlans.find((plan) => plan.reason)?.reason ?? null,
+);
+const firstCustomReason = computed(
+  () => props.customPlans.find((plan) => plan.reason)?.reason ?? null,
+);
 
 defineEmits<{
   close: [];
   "update:mode": [mode: "managed" | "custom"];
   chooseCustom: [];
-  confirm: [plan: MigrationPlan];
+  confirm: [plans: MigrationPlan[]];
 }>();
 </script>
 
@@ -30,8 +50,10 @@ defineEmits<{
     @close="$emit('close')"
   >
     <div class="source-line">
-      <span>待迁移</span>
-      <code>{{ source }}</code>
+      <span>待迁移（{{ sources.length }} 项）</span>
+      <div class="path-list">
+        <code v-for="source in sources" :key="source">{{ source }}</code>
+      </div>
     </div>
 
     <label class="option" :class="{ selected: mode === 'managed' }">
@@ -39,14 +61,22 @@ defineEmits<{
         type="radio"
         name="destination"
         :checked="mode === 'managed'"
-        :disabled="!managedPlan?.available || busy"
+        :disabled="!managedAvailable || busy"
         @change="$emit('update:mode', 'managed')"
       />
       <span>
         <strong>使用分类托管位置</strong>
         <small>按照 AppData、Program Files 等来源自动归类</small>
-        <code>{{ managedPlan?.managedRoot ?? "没有可用位置" }}</code>
-        <em v-if="managedPlan?.reason">{{ managedPlan.reason }}</em>
+        <code>
+          {{
+            managedRoots.length === 1
+              ? managedRoots[0]
+              : managedRoots.length > 1
+                ? `按分类使用 ${managedRoots.length} 个托管位置`
+                : "没有可用位置"
+          }}
+        </code>
+        <em v-if="firstManagedReason">{{ firstManagedReason }}</em>
       </span>
     </label>
 
@@ -68,19 +98,21 @@ defineEmits<{
         >
           选择目录…
         </BaseButton>
-        <code v-if="customPlan?.managedRoot">{{ customPlan.managedRoot }}</code>
-        <em v-if="customPlan?.reason">{{ customPlan.reason }}</em>
+        <code v-if="customPlans[0]?.managedRoot">{{ customPlans[0].managedRoot }}</code>
+        <em v-if="firstCustomReason">{{ firstCustomReason }}</em>
       </span>
     </label>
 
     <div class="destination-preview">
       <span>最终位置</span>
-      <code>
-        {{
-          (mode === "managed" ? managedPlan?.destination : customPlan?.destination) ??
-            "请选择一个位于其他固定 NTFS 分区的目录"
-        }}
-      </code>
+      <div v-if="activePlans.length" class="path-list mappings">
+        <div v-for="plan in activePlans" :key="plan.source">
+          <code>{{ plan.source }}</code>
+          <span aria-hidden="true">→</span>
+          <code>{{ plan.destination ?? plan.reason ?? "不可用" }}</code>
+        </div>
+      </div>
+      <code v-else>请选择一个位于其他固定 NTFS 分区的目录</code>
     </div>
 
     <template #footer>
@@ -89,13 +121,10 @@ defineEmits<{
         variant="primary"
         :loading="busy"
         :disabled="
-          !(mode === 'managed' ? managedPlan?.available : customPlan?.available)
+          !(mode === 'managed' ? managedAvailable : customAvailable)
         "
         @click="
-          $emit(
-            'confirm',
-            (mode === 'managed' ? managedPlan : customPlan) as MigrationPlan,
-          )
+          $emit('confirm', mode === 'managed' ? managedPlans : customPlans)
         "
       >
         继续迁移
@@ -127,6 +156,24 @@ code {
   color: var(--text-primary);
   font-family: var(--font-family);
   font-size: 13px;
+}
+
+.path-list {
+  display: grid;
+  max-height: 112px;
+  gap: var(--space-1);
+  overflow: auto;
+}
+
+.mappings > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.mappings span {
+  color: var(--text-secondary);
 }
 
 .option {

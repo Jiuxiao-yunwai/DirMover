@@ -89,6 +89,11 @@ export type MigrationPlan = {
   reason: string | null;
 };
 
+export type MigrationRequest = {
+  source: string;
+  destination: string;
+};
+
 export type SortField =
   | "name"
   | "bytes"
@@ -120,7 +125,7 @@ export type ScanPage = {
 };
 
 export type TaskKind = "scan" | "migration" | "restore";
-export type TaskState = "running" | "completed" | "failed" | "cancelled";
+export type TaskState = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export type TaskDescriptor = {
   id: string;

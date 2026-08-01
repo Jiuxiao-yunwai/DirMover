@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import BaseButton from "@/components/base/BaseButton.vue";
 import BaseDialog from "@/components/base/BaseDialog.vue";
@@ -9,6 +9,8 @@ import MigrationDestinationDialog from "@/components/business/MigrationDestinati
 import { api } from "@/services/api";
 import { createScanSessionCache } from "@/services/scanSessionCache";
 import { normalizeAppError } from "@/services/tauri";
+import { estimateMigrationQueue } from "@/utils/migrationEstimate";
+import { sortFolderRows } from "@/utils/folderSort";
 import type {
   BootstrapData,
   FolderRow,
@@ -21,10 +23,15 @@ import type {
 } from "@/types/domain";
 import { copyText, formatBytes, formatInteger } from "@/utils/format";
 
-const props = defineProps<{
-  bootstrap: BootstrapData;
-}>();
+type MigrationQueueEntry = {
+  plan: MigrationPlan;
+  task: TaskDescriptor;
+  estimatedBytes: number;
+  runningAtMs: number | null;
+  finishedAtMs: number | null;
+};
 
+const props = defineProps<{ bootstrap: BootstrapData }>();
 const emit = defineEmits<{
   status: [message: string];
   busy: [busy: boolean];
@@ -34,32 +41,53 @@ const emit = defineEmits<{
 
 const root = ref(props.bootstrap.startupScanRoot ?? props.bootstrap.defaultScanRoot);
 const rows = shallowRef<FolderRow[]>([]);
-const selected = ref<FolderRow | null>(null);
+const selectedPaths = ref<string[]>([]);
 const scanPage = shallowRef<ScanPage | null>(null);
-const activeTask = shallowRef<TaskDescriptor | null>(null);
+const scanTask = shallowRef<TaskDescriptor | null>(null);
+const migrationEntries = shallowRef<MigrationQueueEntry[]>([]);
+const pendingMigrationEvents = new Map<string, TaskEvent>();
+const migrationSizeBySource = new Map<string, number>();
+const migrationQueueCollapsed = ref(false);
+const estimateClock = ref(Date.now());
+let estimateTimer: number | null = null;
 const sortField = ref<SortField>("allocatedBytes");
 const sortDirection = ref<SortDirection>("descending");
 const loadingPreview = ref(false);
+const planningMigration = ref(false);
+const submittingMigration = ref(false);
 const elevationOpen = ref(false);
 const migrationOpen = ref(false);
 const migrationMode = ref<"managed" | "custom">("managed");
-const managedPlan = shallowRef<MigrationPlan | null>(null);
-const customPlan = shallowRef<MigrationPlan | null>(null);
-const pendingPlan = shallowRef<MigrationPlan | null>(null);
+const managedPlans = shallowRef<MigrationPlan[]>([]);
+const customPlans = shallowRef<MigrationPlan[]>([]);
+const pendingPlans = shallowRef<MigrationPlan[]>([]);
 const confirmMigrationOpen = ref(false);
 const scanCache = createScanSessionCache();
 
-const isBusy = computed(
-  () => loadingPreview.value || activeTask.value?.state === "running",
+const isScanBusy = computed(
+  () => loadingPreview.value || ["queued", "running"].includes(scanTask.value?.state ?? ""),
 );
-const selectedPath = computed(() => selected.value?.fullPath ?? null);
+const selectedRows = computed(() => {
+  const paths = new Set(selectedPaths.value);
+  return rows.value.filter((row) => paths.has(row.fullPath));
+});
+const activeMigrationCount = computed(
+  () => migrationEntries.value.filter(({ task }) => ["queued", "running"].includes(task.state)).length,
+);
+const migrationEstimate = computed(() => estimateMigrationQueue(
+  migrationEntries.value.map((entry) => ({
+    id: entry.task.id,
+    state: entry.task.state,
+    percentage: entry.task.percentage,
+    bytes: entry.estimatedBytes,
+    runningAtMs: entry.runningAtMs,
+    finishedAtMs: entry.finishedAtMs,
+  })),
+  estimateClock.value,
+));
 const folderCount = computed(() => scanPage.value?.totalItems ?? rows.value.length);
-const totalLogical = computed(() =>
-  scanPage.value ? formatBytes(scanPage.value.totalBytes) : "未扫描",
-);
-const totalAllocated = computed(() =>
-  scanPage.value ? formatBytes(scanPage.value.totalAllocatedBytes) : "未扫描",
-);
+const totalLogical = computed(() => scanPage.value ? formatBytes(scanPage.value.totalBytes) : "未扫描");
+const totalAllocated = computed(() => scanPage.value ? formatBytes(scanPage.value.totalAllocatedBytes) : "未扫描");
 const currentPreset = computed(() => {
   const match = props.bootstrap.scanPresets.find(
     (preset) => preset.path.toLowerCase() === root.value.toLowerCase(),
@@ -68,10 +96,15 @@ const currentPreset = computed(() => {
 });
 
 onMounted(async () => {
+  estimateTimer = window.setInterval(() => {
+    estimateClock.value = Date.now();
+  }, 1_000);
   await loadPreview();
-  if (props.bootstrap.startupScanRoot && props.bootstrap.isAdministrator) {
-    await startScan(false);
-  }
+  if (props.bootstrap.startupScanRoot && props.bootstrap.isAdministrator) await startScan(false);
+});
+
+onBeforeUnmount(() => {
+  if (estimateTimer !== null) window.clearInterval(estimateTimer);
 });
 
 const chooseRoot = async (): Promise<void> => {
@@ -83,10 +116,7 @@ const chooseRoot = async (): Promise<void> => {
 
 const changePreset = async (event: Event): Promise<void> => {
   const key = (event.target as HTMLSelectElement).value;
-  if (key === "custom") {
-    await chooseRoot();
-    return;
-  }
+  if (key === "custom") return chooseRoot();
   const preset = props.bootstrap.scanPresets.find((item) => item.key === key);
   if (!preset) return;
   root.value = preset.path;
@@ -95,17 +125,14 @@ const changePreset = async (event: Event): Promise<void> => {
 
 const loadPreview = async (): Promise<void> => {
   if (!root.value) return;
-  selected.value = null;
+  selectedPaths.value = [];
   const cached = scanCache.get(root.value);
   if (cached) {
     sortField.value = cached.sortField;
     sortDirection.value = cached.sortDirection;
     scanPage.value = cached.page;
     rows.value = cached.page.items;
-    emit(
-      "status",
-      `已恢复扫描缓存（${cached.page.engine}）：${formatInteger(cached.page.totalItems)} 个文件夹`,
-    );
+    emit("status", `已恢复扫描缓存（${cached.page.engine}）：${formatInteger(cached.page.totalItems)} 个文件夹`);
     return;
   }
   loadingPreview.value = true;
@@ -113,7 +140,11 @@ const loadPreview = async (): Promise<void> => {
   emit("status", `正在列出 ${root.value} 的一级文件夹…`);
   scanPage.value = null;
   try {
-    rows.value = await api.preview(root.value);
+    rows.value = sortFolderRows(
+      await api.preview(root.value),
+      sortField.value,
+      sortDirection.value,
+    );
     emit("status", `已列出 ${formatInteger(rows.value.length)} 个一级文件夹`);
   } catch (error: unknown) {
     notifyError(error);
@@ -136,32 +167,24 @@ const startScan = async (force: boolean): Promise<void> => {
   emit("busy", true);
   emit("status", "正在准备扫描…");
   try {
-    activeTask.value = await api.startScan(root.value, force, onTaskEvent);
+    scanTask.value = await api.startScan(root.value, force, onScanEvent);
   } catch (error: unknown) {
     emit("busy", false);
     notifyError(error);
   }
 };
 
-const onTaskEvent = (event: TaskEvent): void => {
-  activeTask.value = event.task;
+const onScanEvent = (event: TaskEvent): void => {
+  scanTask.value = event.task;
   emit("status", event.task.message);
   if (event.type === "progress") return;
   emit("busy", false);
-  if (event.type === "completed") {
-    if (event.task.kind === "scan" && event.task.resultId) {
-      void loadScanPage(event.task.resultId);
-    } else if (event.task.kind === "migration") {
-      migrationOpen.value = false;
-      confirmMigrationOpen.value = false;
-      emit("notify", event.summary, "success");
-      emit("refreshData");
-      void startScan(true);
-    }
+  if (event.type === "completed" && event.task.resultId) {
+    void loadScanPage(event.task.resultId);
   } else if (event.type === "failed") {
     emit("notify", event.message, "error");
-  } else {
-    emit("notify", "任务已取消。", "warning");
+  } else if (event.type === "cancelled") {
+    emit("notify", "扫描已取消。", "warning");
   }
 };
 
@@ -175,54 +198,52 @@ const loadScanPage = async (resultId: string): Promise<void> => {
     });
     scanPage.value = page;
     rows.value = page.items;
-    selected.value = null;
-    scanCache.set(page.root, {
-      page,
-      sortField: sortField.value,
-      sortDirection: sortDirection.value,
-    });
-    emit(
-      "status",
-      `扫描完成（${page.engine}）：${formatInteger(page.totalItems)} 个文件夹`,
-    );
+    selectedPaths.value = [];
+    scanCache.set(page.root, { page, sortField: sortField.value, sortDirection: sortDirection.value });
+    emit("status", `扫描完成（${page.engine}）：${formatInteger(page.totalItems)} 个文件夹`);
   } catch (error: unknown) {
     notifyError(error);
   }
 };
 
-const cancelTask = async (): Promise<void> => {
-  if (!activeTask.value) return;
+const cancelScan = async (): Promise<void> => {
+  if (!scanTask.value) return;
   try {
-    await api.cancelTask(activeTask.value.id);
-    emit("status", "正在安全停止任务…");
+    await api.cancelTask(scanTask.value.id);
+    emit("status", "正在安全停止扫描…");
   } catch (error: unknown) {
     notifyError(error);
   }
+};
+
+const toggleSelection = (row: FolderRow): void => {
+  selectedPaths.value = selectedPaths.value.includes(row.fullPath)
+    ? selectedPaths.value.filter((path) => path !== row.fullPath)
+    : [...selectedPaths.value, row.fullPath];
+};
+
+const toggleAllVisible = (): void => {
+  const visible = rows.value.map((row) => row.fullPath);
+  const selected = new Set(selectedPaths.value);
+  const allSelected = visible.length > 0 && visible.every((path) => selected.has(path));
+  selectedPaths.value = allSelected
+    ? selectedPaths.value.filter((path) => !visible.includes(path))
+    : [...new Set([...selectedPaths.value, ...visible])];
 };
 
 const changeSort = async (field: SortField): Promise<void> => {
   if (sortField.value === field) {
-    sortDirection.value =
-      sortDirection.value === "ascending" ? "descending" : "ascending";
+    sortDirection.value = sortDirection.value === "ascending" ? "descending" : "ascending";
   } else {
     sortField.value = field;
     sortDirection.value = field === "name" ? "ascending" : "descending";
   }
-  if (scanPage.value) {
-    await loadScanPage(scanPage.value.resultId);
-  } else {
-    rows.value = [...rows.value].sort((left, right) =>
-      left.name.localeCompare(right.name, "zh-CN"),
-    );
-  }
+  if (scanPage.value) await loadScanPage(scanPage.value.resultId);
+  else rows.value = sortFolderRows(rows.value, sortField.value, sortDirection.value);
 };
 
 const openFolder = async (row: FolderRow): Promise<void> => {
-  try {
-    await api.openPath(row.fullPath);
-  } catch (error: unknown) {
-    notifyError(error);
-  }
+  try { await api.openPath(row.fullPath); } catch (error: unknown) { notifyError(error); }
 };
 
 const copyFolder = async (row: FolderRow): Promise<void> => {
@@ -231,73 +252,231 @@ const copyFolder = async (row: FolderRow): Promise<void> => {
 };
 
 const prepareMigration = async (): Promise<void> => {
-  const row = selected.value;
-  if (!row) {
-    emit("notify", "请先选择一个文件夹。", "warning");
+  const selected = selectedRows.value;
+  if (!selected.length) {
+    emit("notify", "请至少选择一个文件夹。", "warning");
     return;
   }
-  if (row.isLink || row.linkCount > 0) {
-    emit("notify", "目录本身或内部含有链接，安全检查未通过。", "warning");
+  const unsafe = selected.filter((row) => row.isLink || row.linkCount > 0);
+  if (unsafe.length) {
+    emit("notify", `${unsafe.length} 个目录本身或内部含有链接，安全检查未通过。`, "warning");
+    return;
+  }
+  const activeSources = new Set(
+    migrationEntries.value
+      .filter(({ task }) => ["queued", "running"].includes(task.state))
+      .map(({ plan }) => plan.source.toLowerCase()),
+  );
+  const duplicate = selected.find((row) => activeSources.has(row.fullPath.toLowerCase()));
+  if (duplicate) {
+    emit("notify", `${duplicate.name} 已在迁移队列中。`, "warning");
     return;
   }
   if (!props.bootstrap.isAdministrator) {
     elevationOpen.value = true;
     return;
   }
+  planningMigration.value = true;
   try {
-    managedPlan.value = await api.planMigration(row.fullPath, null);
-    customPlan.value = null;
-    migrationMode.value = managedPlan.value.available ? "managed" : "custom";
+    for (const row of selected) {
+      migrationSizeBySource.set(row.fullPath, row.allocatedBytes || row.bytes);
+    }
+    managedPlans.value = await Promise.all(selected.map((row) => api.planMigration(row.fullPath, null)));
+    customPlans.value = [];
+    migrationMode.value = managedPlans.value.every((plan) => plan.available) ? "managed" : "custom";
     migrationOpen.value = true;
   } catch (error: unknown) {
     notifyError(error);
+  } finally {
+    planningMigration.value = false;
   }
 };
 
 const chooseCustomDestination = async (): Promise<void> => {
-  const customRoot = await api.chooseDirectory("选择本次迁移的托管根目录");
-  if (!customRoot || !selected.value) return;
+  const customRoot = await api.chooseDirectory("选择本次批量迁移的托管根目录");
+  if (!customRoot || !managedPlans.value.length) return;
+  planningMigration.value = true;
   try {
-    customPlan.value = await api.planMigration(
-      selected.value.fullPath,
-      customRoot,
+    customPlans.value = await Promise.all(
+      managedPlans.value.map((plan) => api.planMigration(plan.source, customRoot)),
     );
     migrationMode.value = "custom";
   } catch (error: unknown) {
     notifyError(error);
+  } finally {
+    planningMigration.value = false;
   }
 };
 
-const confirmMigration = (plan: MigrationPlan): void => {
-  pendingPlan.value = plan;
+const confirmMigration = (plans: MigrationPlan[]): void => {
+  pendingPlans.value = plans;
   confirmMigrationOpen.value = true;
 };
 
 const executeMigration = async (): Promise<void> => {
-  const plan = pendingPlan.value;
-  if (!plan?.destination) return;
-  confirmMigrationOpen.value = false;
-  emit("busy", true);
-  emit("status", "正在准备迁移…");
+  const plans = pendingPlans.value;
+  if (!plans.length || plans.some((plan) => !plan.destination)) return;
+  submittingMigration.value = true;
   try {
-    activeTask.value = await api.startMigration(
-      plan.source,
-      plan.destination,
-      onTaskEvent,
+    const tasks = await api.startMigrations(
+      plans.map((plan) => ({ source: plan.source, destination: plan.destination! })),
+      onMigrationEvent,
     );
+    migrationEntries.value = [
+      ...migrationEntries.value,
+      ...tasks.map((task, index) => ({
+        plan: plans[index],
+        task,
+        estimatedBytes: migrationSizeBySource.get(plans[index].source) ?? 0,
+        runningAtMs: task.state === "running" ? Date.now() : null,
+        finishedAtMs: null,
+      })),
+    ];
+    for (const task of tasks) {
+      const pending = pendingMigrationEvents.get(task.id);
+      if (pending) {
+        pendingMigrationEvents.delete(task.id);
+        onMigrationEvent(pending);
+      }
+    }
+    selectedPaths.value = selectedPaths.value.filter(
+      (path) => !plans.some((plan) => plan.source === path),
+    );
+    migrationOpen.value = false;
+    confirmMigrationOpen.value = false;
+    emit("status", `${tasks.length} 个迁移任务已加入后台队列。`);
+    emit("notify", `已加入后台队列：${tasks.length} 项。`, "success");
   } catch (error: unknown) {
-    emit("busy", false);
+    notifyError(error);
+  } finally {
+    submittingMigration.value = false;
+  }
+};
+
+const onMigrationEvent = (event: TaskEvent): void => {
+  const index = migrationEntries.value.findIndex(({ task }) => task.id === event.task.id);
+  if (index < 0) {
+    pendingMigrationEvents.set(event.task.id, event);
+    return;
+  }
+  const entry = migrationEntries.value[index];
+  const updated = [...migrationEntries.value];
+  const now = Date.now();
+  updated[index] = {
+    ...entry,
+    task: event.task,
+    runningAtMs:
+      entry.runningAtMs ?? (event.task.state === "running" ? now : null),
+    finishedAtMs:
+      ["completed", "failed", "cancelled"].includes(event.task.state)
+        ? (entry.finishedAtMs ?? now)
+        : entry.finishedAtMs,
+  };
+  migrationEntries.value = updated;
+  emit("status", event.task.message);
+  if (event.type === "progress") return;
+  if (event.type === "completed") {
+    scanCache.clear();
+    const movedRow = rows.value.find((row) => row.fullPath === entry.plan.source);
+    rows.value = rows.value.filter((row) => row.fullPath !== entry.plan.source);
+    selectedPaths.value = selectedPaths.value.filter((path) => path !== entry.plan.source);
+    if (scanPage.value && movedRow) {
+      scanPage.value = {
+        ...scanPage.value,
+        items: rows.value,
+        totalItems: Math.max(0, scanPage.value.totalItems - 1),
+        totalBytes: Math.max(0, scanPage.value.totalBytes - movedRow.bytes),
+        totalAllocatedBytes: Math.max(0, scanPage.value.totalAllocatedBytes - movedRow.allocatedBytes),
+        totalFiles: Math.max(0, scanPage.value.totalFiles - movedRow.fileCount),
+      };
+    }
+    emit("notify", event.summary, "success");
+    emit("refreshData");
+  } else if (event.type === "failed") {
+    emit("notify", event.message, "error");
+  } else {
+    emit("notify", `已取消：${entry.plan.source}`, "warning");
+  }
+};
+
+const cancelMigration = async (task: TaskDescriptor): Promise<void> => {
+  try {
+    const cancelled = await api.cancelTask(task.id);
+    const index = migrationEntries.value.findIndex(
+      ({ task: entryTask }) => entryTask.id === task.id,
+    );
+    if (index >= 0) {
+      const updated = [...migrationEntries.value];
+      updated[index] = {
+        ...updated[index],
+        task: cancelled,
+        finishedAtMs:
+          cancelled.state === "cancelled"
+            ? (updated[index].finishedAtMs ?? Date.now())
+            : updated[index].finishedAtMs,
+      };
+      migrationEntries.value = updated;
+    }
+    emit("status", task.state === "queued" ? "排队任务将在轮到时跳过。" : "正在安全停止迁移…");
+  } catch (error: unknown) {
     notifyError(error);
   }
 };
+
+const taskStateLabel = (task: TaskDescriptor): string => ({
+  queued: "排队中",
+  running: "迁移中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+})[task.state];
+
+const formatEstimateDuration = (milliseconds: number): string => {
+  const seconds = Math.max(1, Math.ceil(milliseconds / 1_000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours} 小时 ${remainingMinutes} 分钟` : `${hours} 小时`;
+};
+
+const entryEstimateLabel = (entry: MigrationQueueEntry): string => {
+  const estimate = migrationEstimate.value.entries[entry.task.id];
+  if (!estimate) return "正在估算";
+  if (entry.task.state === "running") {
+    return estimate.remainingMs === null
+      ? "正在采样速度"
+      : `剩余约 ${formatEstimateDuration(estimate.remainingMs)}`;
+  }
+  if (entry.task.state === "queued") {
+    if (estimate.waitMs === null) return "等待速度样本";
+    const starts = estimate.waitMs < 1_000
+      ? "即将开始"
+      : `约 ${formatEstimateDuration(estimate.waitMs)}后开始`;
+    return estimate.durationMs === null
+      ? starts
+      : `${starts} · 用时约 ${formatEstimateDuration(estimate.durationMs)}`;
+  }
+  if (entry.task.state === "completed" && estimate.elapsedMs !== null) {
+    return `用时 ${formatEstimateDuration(estimate.elapsedMs)}`;
+  }
+  return entry.task.message;
+};
+
+const queueEstimateLabel = computed(() => {
+  if (activeMigrationCount.value === 0) return "队列已完成";
+  const remaining = migrationEstimate.value.totalRemainingMs;
+  return remaining === null
+    ? "用时正在估算"
+    : `预计剩余 ${formatEstimateDuration(remaining)}`;
+});
 
 const elevate = async (): Promise<void> => {
   try {
     const launched = await api.requestElevation(root.value);
     elevationOpen.value = false;
-    if (launched) {
-      await getCurrentWindow().close();
-    }
+    if (launched) await getCurrentWindow().close();
   } catch (error: unknown) {
     notifyError(error);
   }
@@ -317,7 +496,7 @@ const notifyError = (error: unknown): void => {
     </header>
 
     <div class="toolbar">
-      <select :value="currentPreset" :disabled="isBusy" @change="changePreset">
+      <select :value="currentPreset" :disabled="isScanBusy" @change="changePreset">
         <option
           v-for="preset in bootstrap.scanPresets"
           :key="preset.key"
@@ -327,7 +506,7 @@ const notifyError = (error: unknown): void => {
         </option>
         <option value="custom">自选目录…</option>
       </select>
-      <div class="path-picker" :class="{ disabled: isBusy }">
+      <div class="path-picker" :class="{ disabled: isScanBusy }">
         <input
           class="path-display"
           type="text"
@@ -340,7 +519,7 @@ const notifyError = (error: unknown): void => {
           type="button"
           title="选择分析目录"
           aria-label="选择分析目录"
-          :disabled="isBusy"
+          :disabled="isScanBusy"
           @click="chooseRoot"
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -352,35 +531,81 @@ const notifyError = (error: unknown): void => {
       </div>
       <BaseButton
         variant="primary"
-        :disabled="isBusy"
+        :disabled="isScanBusy"
         @click="requestScan(false)"
       >
         扫描
       </BaseButton>
-      <BaseButton :disabled="isBusy" @click="requestScan(true)">
+      <BaseButton :disabled="isScanBusy" @click="requestScan(true)">
         重新扫描
       </BaseButton>
       <BaseButton
-        v-if="isBusy && activeTask?.state === 'running'"
-        @click="cancelTask"
+        v-if="scanTask?.state === 'running'"
+        @click="cancelScan"
       >
         停止
       </BaseButton>
       <BaseButton
         variant="primary"
-        :disabled="isBusy || !selected"
+        :loading="planningMigration"
+        :disabled="isScanBusy || planningMigration || selectedRows.length === 0"
         @click="prepareMigration"
       >
-        迁移选中项
+        迁移选中项（{{ selectedRows.length }}）
       </BaseButton>
     </div>
 
-    <div v-if="activeTask?.state === 'running'" class="task-progress">
-      <div>
-        <span>{{ activeTask.message }}</span>
-        <strong>{{ activeTask.percentage }}%</strong>
+    <div class="activity-stack">
+      <div v-if="scanTask?.state === 'running'" class="task-progress">
+        <div>
+          <span>{{ scanTask.message }}</span>
+          <strong>{{ scanTask.percentage }}%</strong>
+        </div>
+        <BaseProgress :value="scanTask.percentage" />
       </div>
-      <BaseProgress :value="activeTask.percentage" />
+
+      <section
+        v-if="migrationEntries.length"
+        class="migration-queue"
+        :class="{ collapsed: migrationQueueCollapsed }"
+      >
+        <header>
+          <button
+            type="button"
+            class="queue-toggle"
+            :aria-expanded="!migrationQueueCollapsed"
+            @click="migrationQueueCollapsed = !migrationQueueCollapsed"
+          >
+            <span class="queue-chevron" :class="{ collapsed: migrationQueueCollapsed }" />
+            <strong>后台迁移队列</strong>
+          </button>
+          <span class="queue-summary" title="预估会根据实际迁移速度动态更新">
+            {{ activeMigrationCount }} 项进行中或等待中 · {{ queueEstimateLabel }}
+          </span>
+        </header>
+        <div v-show="!migrationQueueCollapsed" class="queue-list">
+          <article v-for="entry in migrationEntries" :key="entry.task.id">
+            <div class="queue-paths">
+              <strong :title="entry.plan.source">{{ entry.plan.source }}</strong>
+              <span :title="entry.plan.destination ?? ''">→ {{ entry.plan.destination }}</span>
+            </div>
+            <div class="queue-state" :class="entry.task.state">
+              <div>
+                <span>{{ taskStateLabel(entry.task) }}</span>
+                <strong v-if="entry.task.state === 'running'">{{ entry.task.percentage }}%</strong>
+              </div>
+              <small>{{ entryEstimateLabel(entry) }}</small>
+            </div>
+            <BaseButton
+              v-if="entry.task.state === 'queued' || entry.task.state === 'running'"
+              size="small"
+              @click="cancelMigration(entry.task)"
+            >
+              取消
+            </BaseButton>
+          </article>
+        </div>
+      </section>
     </div>
 
     <div class="summary-strip">
@@ -409,11 +634,12 @@ const notifyError = (error: unknown): void => {
       </header>
       <FolderTable
         :rows="rows"
-        :selected-path="selectedPath"
+        :selected-paths="selectedPaths"
         :sort-field="sortField"
         :sort-direction="sortDirection"
         :total-allocated-bytes="scanPage?.totalAllocatedBytes ?? 0"
-        @select="selected = $event"
+        @toggle="toggleSelection"
+        @toggle-all="toggleAllVisible"
         @sort="changeSort"
         @open="openFolder"
         @copy="copyFolder"
@@ -423,11 +649,11 @@ const notifyError = (error: unknown): void => {
 
   <MigrationDestinationDialog
     :open="migrationOpen"
-    :source="selected?.fullPath ?? ''"
+    :sources="managedPlans.map((plan) => plan.source)"
     :mode="migrationMode"
-    :managed-plan="managedPlan"
-    :custom-plan="customPlan"
-    :busy="isBusy"
+    :managed-plans="managedPlans"
+    :custom-plans="customPlans"
+    :busy="planningMigration || submittingMigration"
     @close="migrationOpen = false"
     @update:mode="migrationMode = $event"
     @choose-custom="chooseCustomDestination"
@@ -441,18 +667,20 @@ const notifyError = (error: unknown): void => {
     @close="confirmMigrationOpen = false"
   >
     <div class="confirmation">
-      <p>迁移前请关闭正在使用此目录的程序和服务。</p>
-      <dl>
-        <dt>原位置</dt>
-        <dd>{{ pendingPlan?.source }}</dd>
-        <dt>新位置</dt>
-        <dd>{{ pendingPlan?.destination }}</dd>
-      </dl>
+      <p>迁移前请关闭正在使用这些目录的程序和服务。任务将按下列顺序进入后台队列。</p>
+      <div class="confirmation-list">
+        <dl v-for="plan in pendingPlans" :key="plan.source">
+          <dt>原位置</dt>
+          <dd>{{ plan.source }}</dd>
+          <dt>新位置</dt>
+          <dd>{{ plan.destination }}</dd>
+        </dl>
+      </div>
     </div>
     <template #footer>
-      <BaseButton @click="confirmMigrationOpen = false">取消</BaseButton>
-      <BaseButton variant="primary" @click="executeMigration">
-        开始迁移
+      <BaseButton :disabled="submittingMigration" @click="confirmMigrationOpen = false">取消</BaseButton>
+      <BaseButton variant="primary" :loading="submittingMigration" @click="executeMigration">
+        加入后台队列（{{ pendingPlans.length }}）
       </BaseButton>
     </template>
   </BaseDialog>
@@ -477,6 +705,7 @@ const notifyError = (error: unknown): void => {
 .view {
   display: grid;
   height: 100%;
+  min-width: 0;
   min-height: 0;
   grid-template-rows: auto auto auto auto minmax(0, 1fr);
   gap: var(--space-3);
@@ -577,6 +806,137 @@ select {
   background: var(--accent-subtle);
 }
 
+.activity-stack:empty {
+  display: none;
+}
+
+.activity-stack {
+  display: grid;
+  min-height: 0;
+  gap: var(--space-2);
+}
+
+.migration-queue {
+  display: grid;
+  max-height: 178px;
+  grid-template-rows: 36px minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-medium);
+  background: var(--surface-primary);
+}
+
+.migration-queue.collapsed {
+  max-height: 36px;
+  grid-template-rows: 36px;
+}
+
+.migration-queue > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--font-size-small);
+}
+
+.queue-summary {
+  color: var(--text-secondary);
+}
+
+.migration-queue.collapsed > header {
+  border-bottom-color: transparent;
+}
+
+.queue-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-primary);
+  background: transparent;
+}
+
+.queue-chevron {
+  width: 7px;
+  height: 7px;
+  transform: rotate(45deg);
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  color: var(--text-secondary);
+  transition: transform 120ms ease;
+}
+
+.queue-chevron.collapsed {
+  transform: rotate(-45deg);
+}
+
+.queue-list {
+  overflow: auto;
+}
+
+.queue-list article {
+  display: grid;
+  min-height: 52px;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 220px) auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.queue-paths {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.queue-paths strong,
+.queue-paths span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-paths strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.queue-paths span {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.queue-state {
+  display: grid;
+  gap: 2px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.queue-state > div {
+  display: flex;
+  justify-content: space-between;
+}
+
+.queue-state small {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-state.running,
+.queue-state.completed {
+  color: var(--success);
+}
+
+.queue-state.failed,
+.queue-state.cancelled {
+  color: var(--warning);
+}
+
 .task-progress > div {
   display: flex;
   justify-content: space-between;
@@ -622,6 +982,7 @@ select {
 
 .content-panel {
   display: grid;
+  min-width: 0;
   min-height: 0;
   grid-template-rows: 42px minmax(0, 1fr);
   overflow: hidden;
@@ -664,6 +1025,20 @@ dl {
   grid-template-columns: 68px minmax(0, 1fr);
   gap: var(--space-2);
   margin: var(--space-4) 0 0;
+}
+
+.confirmation-list {
+  display: grid;
+  max-height: 300px;
+  gap: var(--space-3);
+  overflow: auto;
+}
+
+.confirmation-list dl {
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-small);
+  background: var(--surface-secondary);
 }
 
 dt {

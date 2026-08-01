@@ -44,9 +44,9 @@ impl AppState {
         &self.tasks
     }
 
-    /// Return the migration lock Arc so it can be moved into spawn_blocking.
-    /// Only one migration (move or restore) may run at a time.
-    pub fn lock_migration_arc(&self) -> Arc<Mutex<()>> {
+    /// Return the migration gate so it can be acquired inside `spawn_blocking`.
+    /// Move, restore, and recovery operations all share this process-level gate.
+    pub fn migration_gate(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.migration_lock)
     }
 

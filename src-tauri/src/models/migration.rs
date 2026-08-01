@@ -12,6 +12,7 @@ pub mod stage {
     pub const CLEANUP_PENDING: &str = "CleanupPending";
     pub const ROLLBACK_FAILED: &str = "RollbackFailed";
     pub const RESTORING: &str = "Restoring";
+    pub const RESTORE_CLEANUP_PENDING: &str = "RestoreCleanupPending";
     pub const RESTORED: &str = "Restored";
 
     /// Stages that may need recovery intervention
@@ -24,6 +25,7 @@ pub mod stage {
         JUNCTION_CREATED,
         ROLLBACK_FAILED,
         RESTORING,
+        RESTORE_CLEANUP_PENDING,
     ];
 }
 

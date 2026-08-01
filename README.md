@@ -63,6 +63,8 @@ Rust 存储层保留旧版 PascalCase JSON 结构；前端 IPC 使用独立的 c
 
 需要 Node.js 20+、Rust 1.85+、Microsoft C++ Build Tools 与 WebView2。
 
+分支、开发版本号和正式发布流程见 [开发与发布规范](docs/development.md)。日常修改在 `develop` 完成，`main` 仅保存正式发布版本。
+
 ```powershell
 npm install
 npm run tauri -- dev

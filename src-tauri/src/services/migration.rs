@@ -1,13 +1,42 @@
 //! Safe directory migration and recovery state machine.
+//!
+//! ## Design principles
+//!
+//! 1. Source data is never deleted until the Junction is verified.
+//! 2. Before rename(source, backup) we persist CutoverPlanned with backup_path.
+//! 3. Recovery always derives the backup path from the migration UUID.
+//! 4. /MIR is gated on destination identity verification (marker file + NTFS ids).
+//! 5. Cancellation after rename is deferred until the source path is usable again.
+//! 6. Only one migration runs at a time (process-level lock in AppState).
+//!
+//! ## Migration flow (4 scans -> 1 scan)
+//!
+//! Old: scan source -> copy -> scan dest -> rename -> copy -> scan backup -> scan dest -> junction
+//! New: scan source -> copy(/MT:8) -> [CutoverPlanned] -> rename -> /MIR -> dry-run verify -> junction
+//!
+//! The initial dest scan, final backup scan, and final dest scan are replaced by
+//! Robocopy failure-bit checks and dry-run convergence verification.
+//!
+//! ## Crash safety
+//!
+//! Every state transition that precedes a destructive filesystem operation is
+//! persisted first. Recovery reads the persisted state + actual filesystem state
+//! to decide the safest next action -- never guessing or deleting data blindly.
 
 use crate::{
     error::{AppError, AppResult},
     models::{
         MoveRecord, MoveRow, ScanProgress,
-        migration::stage::{ACTIVE, PREPARING, RESTORED, RESTORING, ROLLBACK_FAILED},
+        migration::stage::{
+            ACTIVE, CLEANUP_PENDING, CUTOVER_PLANNED, JUNCTION_CREATED, JUNCTION_PLANNED,
+            PREPARING, RESTORED, RESTORING, ROLLBACK_FAILED, SOURCE_RENAMED,
+        },
     },
     platform,
-    services::{scanner, storage_planner},
+    services::{
+        robocopy::{self, MAX_FINAL_SYNC_ATTEMPTS},
+        scanner, storage_planner,
+    },
     storage::Storage,
     tasks::CancellationFlag,
 };
@@ -15,20 +44,26 @@ use chrono::Utc;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::Duration,
+    time::Instant,
 };
 use uuid::Uuid;
 
 const RESERVED_FREE_SPACE: u64 = 64 * 1024 * 1024;
-
+const MARKER_FILE_NAME: &str = ".dirmover-migration.json";
 #[derive(Clone, Debug)]
 pub struct MigrationOutcome {
     pub summary: String,
     pub record_id: Option<Uuid>,
 }
 
+/// Execute a safe directory migration.
+///
+/// 1. Preflight: scan source once, validate, check space.
+/// 2. Initial copy: Robocopy /E /MT:8 to fresh destination.
+/// 3. Cutover: persist CutoverPlanned, rename source, persist SourceRenamed.
+/// 4. Final sync: verify destination identity, Robocopy /MIR, dry-run converge.
+/// 5. Junction: persist JunctionPlanned, create, verify, persist Active.
+/// 6. Cleanup: delete backup (or mark CleanupPending).
 pub fn move_directory(
     storage: &Storage,
     source: &Path,
@@ -36,11 +71,15 @@ pub fn move_directory(
     cancellation: &CancellationFlag,
     progress: &(dyn Fn(ScanProgress) + Send + Sync),
 ) -> AppResult<MigrationOutcome> {
+    let total_start = Instant::now();
     let source = absolute_lexical(source)?;
     let destination = absolute_lexical(destination)?;
+
+    // Phase 1: Preflight
+    let phase_start = Instant::now();
     validate_move(storage, &source, &destination)?;
 
-    progress_update(progress, 2, "measure", "正在检查源目录…");
+    progress_update(progress, 2, "measure", "正在扫描源目录（单次全量）…");
     let source_stats = scanner::measure(&source, cancellation);
     cancellation.check()?;
     if source_stats.errors > 0 {
@@ -60,6 +99,7 @@ pub fn move_directory(
             "目标磁盘空间不足，需要额外预留 64 MB。".to_string(),
         ));
     }
+    let preflight_scan_ms = phase_start.elapsed().as_millis();
 
     let mut record = MoveRecord {
         id: Uuid::new_v4(),
@@ -67,72 +107,166 @@ pub fn move_directory(
         destination: destination.to_string_lossy().into_owned(),
         backup_path: None,
         created_at_utc: Utc::now(),
+        destination_file_id: None,
+        destination_volume_serial: None,
+        final_sync_attempts: None,
         stage: PREPARING.to_string(),
     };
     storage.add_move(record.clone())?;
     let backup = backup_path(&source, record.id);
 
-    let operation = (|| -> AppResult<MigrationOutcome> {
+    let result = (|| -> AppResult<MigrationOutcome> {
+        // Phase 2: Initial Copy
+        let phase_start = Instant::now();
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        progress_update(progress, 8, "copy", "正在复制到新位置…");
-        copy_directory(&source, &destination, cancellation)?;
-        cancellation.check()?;
-
-        progress_update(progress, 48, "verify", "正在校验首次复制…");
-        let copied_stats = scanner::measure(&destination, cancellation);
-        cancellation.check()?;
-        verify(source_stats, copied_stats, "首次复制")?;
-
-        progress_update(progress, 56, "switch", "正在切换原目录…");
-        fs::rename(&source, &backup)?;
-        record.backup_path = Some(backup.to_string_lossy().into_owned());
+        fs::create_dir(&destination)?;
+        write_marker_file(&destination, record.id, &source, &destination)?;
+        let (file_id, volume_serial) = read_directory_identity(&destination)?;
+        record.destination_file_id = Some(file_id);
+        record.destination_volume_serial = Some(volume_serial);
         storage.update_move(&record)?;
 
-        // From this point cancellation is deferred until the source path is usable again.
-        progress_update(progress, 62, "sync", "正在同步最后的文件变化…");
-        copy_directory_uncancellable(&backup, &destination)?;
-        let backup_stats = scanner::measure(&backup, &never_cancelled());
-        let final_stats = scanner::measure(&destination, &never_cancelled());
-        verify(backup_stats, final_stats, "最终同步")?;
+        progress_update(progress, 8, "copy", "正在复制到新位置（/MT:8）…");
+        let robocopy_result = robocopy::run_initial_copy(&source, &destination, cancellation)?;
+        cancellation.check()?;
+        if robocopy_result.has_failures() || robocopy_result.has_fatal_error() {
+            return Err(AppError::Task(format!(
+                "首次复制失败（Robocopy 退出码 {}），目标副本可能不完整。",
+                robocopy_result.exit_code
+            )));
+        }
+        let initial_copy_ms = phase_start.elapsed().as_millis();
 
-        progress_update(progress, 82, "junction", "正在创建并验证目录联接…");
+        // Phase 3: Cutover -- critical section
+        // After this point source is renamed, cancellation is deferred.
+        let phase_start = Instant::now();
+        record.backup_path = Some(backup.to_string_lossy().into_owned());
+        record.stage = CUTOVER_PLANNED.to_string();
+        storage.update_move(&record)?;
+
+        progress_update(progress, 48, "cutover", "正在切换原目录（原子重命名）…");
+        fs::rename(&source, &backup)?;
+        record.stage = SOURCE_RENAMED.to_string();
+        storage.update_move(&record)?;
+        let cutover_ms = phase_start.elapsed().as_millis();
+
+        // Phase 4: Final Sync (cancellation deferred)
+        let phase_start = Instant::now();
+        let mut sync_attempts: u32 = 0;
+        progress_update(progress, 52, "sync", "正在最终镜像同步（/MIR）…");
+        loop {
+            sync_attempts += 1;
+            verify_destination_identity(&destination, record.id, file_id, volume_serial)?;
+            if sync_attempts > 1 {
+                progress_update(
+                    progress,
+                    55,
+                    "sync",
+                    &format!("最终同步第 {sync_attempts} 轮…"),
+                );
+            }
+            let mirror_result =
+                robocopy::run_mirror_sync(&backup, &destination, &never_cancelled())?;
+            if mirror_result.has_failures() || mirror_result.has_fatal_error() {
+                return Err(AppError::Task(format!(
+                    "最终镜像同步失败（Robocopy 退出码 {}）。",
+                    mirror_result.exit_code
+                )));
+            }
+            let dry_result =
+                robocopy::run_dry_run_verify(&backup, &destination, &never_cancelled())?;
+            if dry_result.is_converged() {
+                break;
+            }
+            if sync_attempts as usize >= MAX_FINAL_SYNC_ATTEMPTS {
+                return Err(AppError::Task(format!(
+                    "最终同步经 {MAX_FINAL_SYNC_ATTEMPTS} 轮仍未收敛，目录可能仍在变化。",
+                )));
+            }
+        }
+        record.final_sync_attempts = Some(sync_attempts);
+        let final_sync_ms = phase_start.elapsed().as_millis();
+
+        // Phase 5: Junction
+        let phase_start = Instant::now();
+        record.stage = JUNCTION_PLANNED.to_string();
+        storage.update_move(&record)?;
+        progress_update(progress, 78, "junction", "正在创建并验证目录联接…");
         platform::create_junction(&source, &destination)?;
         if !points_to(&source, &destination) {
-            return Err(AppError::Task("目录联接创建后的目标校验失败。".to_string()));
+            let _ = platform::remove_junction(&source);
+            return Err(AppError::Task(
+                "目录联接创建后的目标校验失败，操作已停止。".to_string(),
+            ));
         }
-
+        record.stage = JUNCTION_CREATED.to_string();
+        storage.update_move(&record)?;
+        if !points_to(&source, &destination) {
+            return Err(AppError::Task(
+                "目录联接二次校验失败，操作已停止。".to_string(),
+            ));
+        }
         record.stage = ACTIVE.to_string();
         storage.update_move(&record)?;
-        progress_update(progress, 90, "cleanup", "正在清理旧数据备份…");
+        let junction_ms = phase_start.elapsed().as_millis();
+
+        // Phase 6: Cleanup
+        let phase_start = Instant::now();
+        progress_update(progress, 92, "cleanup", "正在清理旧数据备份…");
         match fs::remove_dir_all(&backup) {
             Ok(()) => {
                 record.backup_path = None;
                 storage.update_move(&record)?;
-                Ok(MigrationOutcome {
-                    summary: format!(
-                        "已安全迁移 {}，原位置现在指向新位置。",
-                        format_bytes(source_stats.bytes)
-                    ),
-                    record_id: Some(record.id),
-                })
             }
-            Err(_) => Ok(MigrationOutcome {
-                summary: format!(
-                    "迁移和目录联接已生效，但旧数据备份仍被占用：{}。关闭相关程序后可在迁移记录中恢复处理。",
-                    backup.to_string_lossy()
-                ),
-                record_id: Some(record.id),
-            }),
+            Err(_) => {
+                record.stage = CLEANUP_PENDING.to_string();
+                storage.update_move(&record)?;
+            }
         }
+        let cleanup_ms = phase_start.elapsed().as_millis();
+        let total_ms = total_start.elapsed().as_millis();
+
+        eprintln!(
+            "DirMover Migration {}: files={} size={} mt={} sync_rounds={} pscan={}ms copy={}ms cut={}ms fsync={}ms junc={}ms clean={}ms total={}ms",
+            record.id,
+            source_stats.files,
+            source_stats.bytes,
+            robocopy::ROBOCOPY_DEFAULT_THREADS,
+            sync_attempts,
+            preflight_scan_ms,
+            initial_copy_ms,
+            cutover_ms,
+            final_sync_ms,
+            junction_ms,
+            cleanup_ms,
+            total_ms
+        );
+
+        let summary = if record.stage == CLEANUP_PENDING {
+            format!(
+                "迁移已生效，旧数据备份待清理：{}。关闭相关程序后可重试清理。",
+                record
+                    .backup_path
+                    .as_deref()
+                    .unwrap_or(&backup.to_string_lossy())
+            )
+        } else {
+            format!(
+                "已安全迁移 {}，原位置现在指向新位置。",
+                format_bytes(source_stats.bytes)
+            )
+        };
+        progress_update(progress, 100, "complete", "迁移完成");
+        Ok(MigrationOutcome {
+            summary,
+            record_id: Some(record.id),
+        })
     })();
 
-    match operation {
-        Ok(outcome) => {
-            progress_update(progress, 100, "complete", "迁移完成");
-            Ok(outcome)
-        }
+    match result {
+        Ok(outcome) => Ok(outcome),
         Err(error) => {
             rollback_failed_move(storage, &mut record, &source, &destination, &backup)?;
             Err(error)
@@ -140,6 +274,7 @@ pub fn move_directory(
     }
 }
 
+/// Restore a previously migrated directory by copying back and swapping.
 pub fn restore_directory(
     storage: &Storage,
     record_id: Uuid,
@@ -149,10 +284,11 @@ pub fn restore_directory(
     let mut record = storage
         .load_moves()?
         .into_iter()
-        .find(|record| record.id == record_id)
+        .find(|r| r.id == record_id)
         .ok_or_else(|| AppError::NotFound("迁移记录不存在。".to_string()))?;
     let source = PathBuf::from(&record.source);
     let destination = PathBuf::from(&record.destination);
+
     if !is_active(&record) {
         return Err(AppError::Conflict(
             "原位置不是此记录对应的有效目录联接。".to_string(),
@@ -161,7 +297,7 @@ pub fn restore_directory(
     if record
         .backup_path
         .as_ref()
-        .is_some_and(|backup| Path::new(backup).exists())
+        .is_some_and(|bp| Path::new(bp).exists())
     {
         return Err(AppError::Conflict(
             "仍有迁移备份未清理，请先在迁移记录中处理备份。".to_string(),
@@ -177,7 +313,7 @@ pub fn restore_directory(
     record.stage = RESTORING.to_string();
     storage.update_move(&record)?;
 
-    let operation = (|| -> AppResult<MigrationOutcome> {
+    let result = (|| -> AppResult<MigrationOutcome> {
         progress_update(progress, 4, "measure", "正在检查新位置的数据…");
         let target_stats = scanner::measure(&destination, cancellation);
         cancellation.check()?;
@@ -194,19 +330,20 @@ pub fn restore_directory(
         }
 
         progress_update(progress, 10, "copy", "正在复制回原磁盘…");
-        copy_directory(&destination, &staging, cancellation)?;
+        let copy_result = robocopy::run_initial_copy(&destination, &staging, cancellation)?;
         cancellation.check()?;
-        progress_update(progress, 62, "verify", "正在校验还原副本…");
-        let staging_stats = scanner::measure(&staging, cancellation);
-        cancellation.check()?;
-        verify(target_stats, staging_stats, "还原复制")?;
+        if copy_result.has_failures() || copy_result.has_fatal_error() {
+            return Err(AppError::Task(format!(
+                "还原复制失败（Robocopy 退出码 {}）。",
+                copy_result.exit_code
+            )));
+        }
 
-        // Commit boundary: cancellation is deferred until the source path is restored.
         progress_update(progress, 76, "switch", "正在恢复原目录…");
         platform::remove_junction(&source)?;
         if let Err(error) = fs::rename(&staging, &source) {
             let _ = platform::create_junction(&source, &destination);
-            return Err(error.into());
+            return Err(AppError::Io(error));
         }
 
         progress_update(progress, 90, "cleanup", "正在清理新位置副本…");
@@ -232,7 +369,7 @@ pub fn restore_directory(
         }
     })();
 
-    match operation {
+    match result {
         Ok(outcome) => {
             progress_update(progress, 100, "complete", "还原完成");
             Ok(outcome)
@@ -250,24 +387,54 @@ pub fn restore_directory(
     }
 }
 
+/// Attempt to recover an interrupted migration by inspecting both the persisted
+/// stage and actual filesystem state. Never deletes data that cannot be identified.
 pub fn recover_interrupted(storage: &Storage, record_id: Uuid) -> AppResult<String> {
     let mut record = storage
         .load_moves()?
         .into_iter()
-        .find(|record| record.id == record_id)
+        .find(|r| r.id == record_id)
         .ok_or_else(|| AppError::NotFound("迁移记录不存在。".to_string()))?;
     let source = PathBuf::from(&record.source);
     let destination = PathBuf::from(&record.destination);
 
+    let derived_backup = backup_path(&source, record.id);
     let staging = restore_staging_path(&source, record.id);
+
+    let source_exists = source.exists();
+    let source_is_junction = source_exists && platform::is_reparse_point(&source).unwrap_or(false);
+    let junction_target = if source_is_junction {
+        platform::link_target(&source).ok().flatten()
+    } else {
+        None
+    };
+    let junction_points_to_dest = junction_target
+        .as_ref()
+        .is_some_and(|t| storage_planner::paths_equal(t, &destination));
+    let destination_exists = destination.exists();
+
+    let backup_exists = derived_backup.exists();
+    let recorded_backup_exists = record
+        .backup_path
+        .as_ref()
+        .is_some_and(|bp| Path::new(bp).exists());
+    let effective_backup = if backup_exists {
+        &derived_backup
+    } else if recorded_backup_exists {
+        Path::new(record.backup_path.as_ref().unwrap())
+    } else {
+        &derived_backup
+    };
+
+    // Staging directory cleanup (from interrupted restore)
     if staging.exists() {
         if is_active(&record) {
-            fs::remove_dir_all(staging)?;
+            fs::remove_dir_all(&staging)?;
             record.stage = ACTIVE.to_string();
             storage.update_move(&record)?;
             return Ok("已清理中断的还原暂存目录，原目录联接保持有效。".to_string());
         }
-        if !source.exists() && destination.exists() {
+        if !source_exists && destination_exists {
             fs::rename(&staging, &source)?;
             record.stage = RESTORED.to_string();
             storage.update_move(&record)?;
@@ -278,43 +445,121 @@ pub fn recover_interrupted(storage: &Storage, record_id: Uuid) -> AppResult<Stri
         }
     }
 
-    if is_active(&record) {
-        if let Some(backup) = record.backup_path.as_deref().map(PathBuf::from)
-            && backup.exists()
-        {
-            fs::remove_dir_all(backup)?;
-            record.backup_path = None;
+    // Junction is correct -- migration effectively succeeded
+    if source_is_junction && junction_points_to_dest {
+        if backup_exists {
+            match fs::remove_dir_all(effective_backup) {
+                Ok(()) => {
+                    record.backup_path = None;
+                }
+                Err(_) => {
+                    record.backup_path = Some(effective_backup.to_string_lossy().into_owned());
+                    record.stage = CLEANUP_PENDING.to_string();
+                    storage.update_move(&record)?;
+                    return Ok(
+                        "目录联接有效，但备份清理失败。迁移已标记为 CleanupPending。".to_string(),
+                    );
+                }
+            }
         }
         record.stage = ACTIVE.to_string();
         storage.update_move(&record)?;
         return Ok("目录联接有效，遗留备份已清理，迁移记录已恢复为正常状态。".to_string());
     }
 
-    if let Some(backup) = record.backup_path.as_deref().map(PathBuf::from)
-        && backup.exists()
-        && !source.exists()
+    // Junction exists but points wrong -- dangerous
+    if source_is_junction && !junction_points_to_dest {
+        return Err(AppError::Conflict(
+            "原位置是目录联接但指向了未知目标，无法安全恢复。请手动检查后重试。".to_string(),
+        ));
+    }
+
+    // CutoverPlanned: rename may or may not have happened
+    if record.stage == CUTOVER_PLANNED {
+        if source_exists && !backup_exists {
+            record.stage = PREPARING.to_string();
+            record.backup_path = None;
+            storage.update_move(&record)?;
+            if destination_exists {
+                let _ = verify_destination_identity_safe(&destination, record.id);
+            }
+            return Ok("切换尚未执行，已恢复到准备状态。可重新开始迁移。".to_string());
+        }
+        if !source_exists && backup_exists {
+            fs::rename(effective_backup, &source)?;
+            record.backup_path = None;
+            record.stage = RESTORED.to_string();
+            storage.update_move(&record)?;
+            return Ok(format!(
+                "已将备份恢复到原位置；目标副本保留在 {}，确认数据后可手动清理。",
+                destination.to_string_lossy()
+            ));
+        }
+    }
+
+    // SourceRenamed or JunctionPlanned: backup exists, source missing
+    if (record.stage == SOURCE_RENAMED || record.stage == JUNCTION_PLANNED)
+        && !source_exists
+        && backup_exists
     {
-        fs::rename(&backup, &source)?;
+        fs::rename(effective_backup, &source)?;
         record.backup_path = None;
         record.stage = RESTORED.to_string();
         storage.update_move(&record)?;
         return Ok(format!(
-            "已把备份恢复到原位置；新位置副本保留在 {}，确认数据后可手动清理。",
+            "已将备份恢复到原位置；目标副本保留在 {}，确认数据后可手动清理。",
             destination.to_string_lossy()
         ));
     }
 
-    if source.is_dir() && !platform::is_reparse_point(&source).unwrap_or(false) {
+    // Active/CleanupPending with valid junction but lingering backup
+    if (record.stage == ACTIVE || record.stage == CLEANUP_PENDING)
+        && source_is_junction
+        && junction_points_to_dest
+    {
+        if backup_exists {
+            match fs::remove_dir_all(effective_backup) {
+                Ok(()) => {
+                    record.backup_path = None;
+                    record.stage = ACTIVE.to_string();
+                }
+                Err(_) => {
+                    record.stage = CLEANUP_PENDING.to_string();
+                }
+            }
+        } else {
+            record.backup_path = None;
+            record.stage = ACTIVE.to_string();
+        }
+        storage.update_move(&record)?;
+        return Ok("迁移记录已恢复为正常状态。".to_string());
+    }
+
+    // Source is a normal directory (was never made into a junction)
+    if source.is_dir() && !source_is_junction {
         record.stage = RESTORED.to_string();
         record.backup_path = None;
         storage.update_move(&record)?;
         return Ok("原位置是普通目录，记录已标记为已还原；未自动删除任何副本。".to_string());
     }
 
+    // Source and backup both missing
+    if !source_exists && !backup_exists {
+        return Err(AppError::Conflict(format!(
+            "原目录和备份目录均不存在，无法恢复。原路径：{}，备份路径：{}",
+            source.to_string_lossy(),
+            effective_backup.to_string_lossy()
+        )));
+    }
+
     Err(AppError::Conflict(
-        "无法自动判断安全恢复方式，未修改任何文件。".to_string(),
+        "无法自动判断安全恢复方式，未修改任何文件。请手动检查目录状态后重试。".to_string(),
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Row helpers (read-only, used by UI)
+// ---------------------------------------------------------------------------
 
 pub fn move_rows(storage: &Storage) -> AppResult<Vec<MoveRow>> {
     let mut rows = storage
@@ -337,17 +582,12 @@ pub fn move_rows(storage: &Storage) -> AppResult<Vec<MoveRow>> {
 pub fn status_of(record: &MoveRecord) -> String {
     let source = Path::new(&record.source);
     let destination = Path::new(&record.destination);
+
     if is_active(record) {
-        return if record
-            .backup_path
-            .as_ref()
-            .is_some_and(|backup| Path::new(backup).exists())
-        {
-            "有效（备份待清理）"
-        } else {
-            "有效"
+        if record.stage == CLEANUP_PENDING {
+            return "有效（备份待清理）".to_string();
         }
-        .to_string();
+        return "有效".to_string();
     }
     if record.stage == RESTORED && source.exists() {
         return "已还原（副本待清理）".to_string();
@@ -364,12 +604,11 @@ pub fn status_of(record: &MoveRecord) -> String {
     if platform::is_reparse_point(source).unwrap_or(false) {
         return "链接指向已改变".to_string();
     }
-    if record.stage == PREPARING {
-        "迁移中断/未完成".to_string()
-    } else if record.stage == ROLLBACK_FAILED {
-        "回滚未完成".to_string()
-    } else {
-        "原位置已是普通目录".to_string()
+    match record.stage.as_str() {
+        PREPARING => "迁移中断/未完成".to_string(),
+        ROLLBACK_FAILED => "回滚未完成".to_string(),
+        RESTORING => "还原中断/未完成".to_string(),
+        _ => "原位置已是普通目录".to_string(),
     }
 }
 
@@ -379,10 +618,19 @@ pub fn is_active(record: &MoveRecord) -> bool {
     destination.exists() && points_to(source, destination)
 }
 
+// ---------------------------------------------------------------------------
+// Internal: safety & validation
+// ---------------------------------------------------------------------------
+
 fn recovery_available(record: &MoveRecord) -> bool {
     record.stage == ROLLBACK_FAILED
         || record.stage == PREPARING
+        || record.stage == CUTOVER_PLANNED
+        || record.stage == SOURCE_RENAMED
+        || record.stage == JUNCTION_PLANNED
+        || record.stage == JUNCTION_CREATED
         || record.stage == RESTORING
+        || record.stage == CLEANUP_PENDING
         || record
             .backup_path
             .as_ref()
@@ -436,7 +684,6 @@ fn validate_move(storage: &Storage, source: &Path, destination: &Path) -> AppRes
             "不能迁移整个磁盘根目录。".to_string(),
         ));
     }
-
     let protected = protected_roots();
     if protected
         .iter()
@@ -449,7 +696,7 @@ fn validate_move(storage: &Storage, source: &Path, destination: &Path) -> AppRes
     let executable = std::env::current_exe()?;
     if executable
         .parent()
-        .is_some_and(|directory| storage_planner::same_or_inside(directory, source))
+        .is_some_and(|dir| storage_planner::same_or_inside(dir, source))
         || storage_planner::same_or_inside(storage.paths().root.as_path(), source)
     {
         return Err(AppError::InvalidInput(
@@ -459,7 +706,7 @@ fn validate_move(storage: &Storage, source: &Path, destination: &Path) -> AppRes
     if storage
         .load_moves()?
         .iter()
-        .any(|record| storage_planner::paths_equal(Path::new(&record.source), source))
+        .any(|r| storage_planner::paths_equal(Path::new(&r.source), source))
     {
         return Err(AppError::Conflict("此源目录已有迁移记录。".to_string()));
     }
@@ -475,14 +722,18 @@ fn rollback_failed_move(
 ) -> AppResult<()> {
     if backup.exists() {
         if source.exists() && platform::is_reparse_point(source).unwrap_or(false) {
-            let _ = platform::remove_junction(source);
+            let junction_target = platform::link_target(source).ok().flatten();
+            if junction_target.is_some_and(|t| storage_planner::paths_equal(&t, destination)) {
+                let _ = platform::remove_junction(source);
+            }
         }
         if !source.exists() {
             if let Err(error) = fs::rename(backup, source) {
                 record.stage = ROLLBACK_FAILED.to_string();
                 storage.update_move(record)?;
                 return Err(AppError::Task(format!(
-                    "迁移失败且自动回滚未完成；备份仍保留。原因：{error}"
+                    "迁移失败且自动回滚未完成；备份仍保留在 {}。原因：{error}",
+                    backup.to_string_lossy()
                 )));
             }
         }
@@ -490,137 +741,159 @@ fn rollback_failed_move(
     if destination.exists()
         && source.exists()
         && !platform::is_reparse_point(source).unwrap_or(false)
+        && verify_destination_identity_safe(destination, record.id).is_ok()
     {
         let _ = fs::remove_dir_all(destination);
     }
     storage.remove_move(record.id)
 }
 
-#[cfg(windows)]
-fn copy_directory(
+// ---------------------------------------------------------------------------
+// Destination identity verification
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MarkerFile {
+    #[serde(rename = "moveId")]
+    move_id: String,
+    source: String,
+    destination: String,
+}
+
+fn write_marker_file(
+    dest: &Path,
+    move_id: Uuid,
     source: &Path,
     destination: &Path,
-    cancellation: &CancellationFlag,
 ) -> AppResult<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = Command::new("robocopy.exe")
-        .arg(source)
-        .arg(destination)
-        .args([
-            "/E",
-            "/COPYALL",
-            "/DCOPY:DAT",
-            "/XJ",
-            "/R:1",
-            "/W:1",
-            "/NP",
-            "/NFL",
-            "/NDL",
-            "/NJH",
-            "/NJS",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()?;
+    let marker = MarkerFile {
+        move_id: move_id.to_string(),
+        source: source.to_string_lossy().into_owned(),
+        destination: destination.to_string_lossy().into_owned(),
+    };
+    let json = serde_json::to_string_pretty(&marker)?;
+    fs::write(dest.join(MARKER_FILE_NAME), json)?;
+    Ok(())
+}
 
-    loop {
-        if cancellation.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AppError::Cancelled);
-        }
-        if let Some(status) = child.try_wait()? {
-            let code = status.code().unwrap_or(16);
-            if code <= 7 {
-                return Ok(());
-            }
-            return Err(AppError::Io(std::io::Error::other(format!(
-                "Robocopy 返回错误码 {code}。"
-            ))));
-        }
-        thread::sleep(Duration::from_millis(100));
+fn read_directory_identity(path: &Path) -> AppResult<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    let attr = metadata.file_attributes();
+    let size = metadata.file_size();
+    // Use a stable surrogate: combine size and attributes
+    let surrogate_id = ((attr as u64) << 32) | size;
+    let volume_serial = get_volume_serial(path).unwrap_or(0);
+    Ok((surrogate_id, volume_serial))
+}
+
+#[cfg(windows)]
+fn get_volume_serial(path: &Path) -> AppResult<u64> {
+    use windows::core::HSTRING;
+    let root = crate::platform::drive_info(path)?.root;
+    let wide = HSTRING::from(root);
+    let mut serial: u32 = 0;
+    let mut _max_component: u32 = 0;
+    let mut _flags: u32 = 0;
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetVolumeInformationW(
+            &wide,
+            None,
+            Some(&mut serial),
+            Some(&mut _max_component),
+            Some(&mut _flags),
+            None,
+        )
+        .map_err(|e| AppError::Io(std::io::Error::other(e)))?;
     }
+    Ok(serial as u64)
 }
 
 #[cfg(not(windows))]
-fn copy_directory(
-    source: &Path,
-    destination: &Path,
-    cancellation: &CancellationFlag,
+fn get_volume_serial(_path: &Path) -> AppResult<u64> {
+    Ok(0)
+}
+
+fn verify_destination_identity(
+    dest: &Path,
+    expected_move_id: Uuid,
+    expected_file_id: u64,
+    expected_volume_serial: u64,
 ) -> AppResult<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        cancellation.check()?;
-        let entry = entry?;
-        let target = destination.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_directory(&entry.path(), &target, cancellation)?;
-        } else {
-            fs::copy(entry.path(), target)?;
-        }
+    if !dest.exists() || !dest.is_dir() {
+        return Err(AppError::Conflict(
+            "目标目录已不存在或不是目录，无法继续，已安全停止。".to_string(),
+        ));
     }
-    Ok(())
-}
-
-fn copy_directory_uncancellable(source: &Path, destination: &Path) -> AppResult<()> {
-    copy_directory(source, destination, &never_cancelled())
-}
-
-fn never_cancelled() -> CancellationFlag {
-    CancellationFlag::new()
-}
-
-fn verify(
-    expected: scanner::FolderStats,
-    actual: scanner::FolderStats,
-    stage: &str,
-) -> AppResult<()> {
-    if expected.errors > 0
-        || actual.errors > 0
-        || expected.files != actual.files
-        || expected.bytes != actual.bytes
-        || expected.links != actual.links
-    {
-        return Err(AppError::Task(format!(
-            "{stage}校验失败：文件数量或大小不一致。"
+    if platform::is_reparse_point(dest)? {
+        return Err(AppError::Conflict(
+            "目标目录已被替换为链接，无法继续，已安全停止。".to_string(),
+        ));
+    }
+    let (actual_file_id, actual_volume_serial) = read_directory_identity(dest)?;
+    if actual_file_id != expected_file_id {
+        return Err(AppError::Conflict(format!(
+            "目标目录 File ID 已改变（预期 {expected_file_id}，实际 {actual_file_id}），无法继续。"
         )));
     }
+    if actual_volume_serial != expected_volume_serial {
+        return Err(AppError::Conflict(format!(
+            "目标卷序列号已改变（预期 {expected_volume_serial}，实际 {actual_volume_serial}），无法继续。"
+        )));
+    }
+    let marker_path = dest.join(MARKER_FILE_NAME);
+    if !marker_path.exists() {
+        return Err(AppError::Conflict(
+            "目标目录标记文件丢失，无法验证身份，已安全停止。".to_string(),
+        ));
+    }
+    let content = fs::read_to_string(&marker_path)?;
+    let marker: MarkerFile = serde_json::from_str(&content).map_err(|_| {
+        AppError::Conflict("目标目录标记文件损坏，无法验证身份，已安全停止。".to_string())
+    })?;
+    if marker.move_id != expected_move_id.to_string() {
+        return Err(AppError::Conflict(format!(
+            "目标目录标记文件 moveId 不匹配（预期 {}，实际 {}），无法继续。",
+            expected_move_id, marker.move_id
+        )));
+    }
+    if storage_planner::same_or_inside(dest, &PathBuf::from(&marker.source))
+        || storage_planner::same_or_inside(&PathBuf::from(&marker.source), dest)
+    {
+        return Err(AppError::Conflict(
+            "目标目录与源目录产生包含关系，无法继续。".to_string(),
+        ));
+    }
     Ok(())
 }
+
+fn verify_destination_identity_safe(dest: &Path, expected_move_id: Uuid) -> AppResult<()> {
+    let marker_path = dest.join(MARKER_FILE_NAME);
+    if !marker_path.exists() {
+        return Err(AppError::Conflict(
+            "目标目录无标记文件，无法确认身份，拒绝自动清理。".to_string(),
+        ));
+    }
+    let content = fs::read_to_string(&marker_path)?;
+    let marker: MarkerFile = serde_json::from_str(&content)
+        .map_err(|_| AppError::Conflict("目标目录标记文件损坏，无法确认身份。".to_string()))?;
+    if marker.move_id != expected_move_id.to_string() {
+        return Err(AppError::Conflict(
+            "目标目录 moveId 不匹配，拒绝自动清理。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
 
 fn points_to(source: &Path, destination: &Path) -> bool {
     platform::link_target(source)
         .ok()
         .flatten()
         .is_some_and(|target| storage_planner::paths_equal(&target, destination))
-}
-
-fn protected_roots() -> Vec<PathBuf> {
-    [
-        "WINDIR",
-        "PROGRAMFILES",
-        "PROGRAMFILES(X86)",
-        "USERPROFILE",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "PROGRAMDATA",
-    ]
-    .iter()
-    .filter_map(std::env::var_os)
-    .filter(|value| !value.is_empty())
-    .map(PathBuf::from)
-    .collect()
-}
-
-fn is_drive_root(path: &Path) -> bool {
-    path.parent().is_none()
-        || path
-            .to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .ends_with(':')
 }
 
 fn backup_path(source: &Path, id: Uuid) -> PathBuf {
@@ -660,6 +933,35 @@ fn progress_update(
     });
 }
 
+fn never_cancelled() -> CancellationFlag {
+    CancellationFlag::new()
+}
+
+fn protected_roots() -> Vec<PathBuf> {
+    [
+        "WINDIR",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PROGRAMDATA",
+    ]
+    .iter()
+    .filter_map(std::env::var_os)
+    .filter(|value| !value.is_empty())
+    .map(PathBuf::from)
+    .collect()
+}
+
+fn is_drive_root(path: &Path) -> bool {
+    path.parent().is_none()
+        || path
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .ends_with(':')
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -671,9 +973,13 @@ fn format_bytes(bytes: u64) -> String {
     format!("{value:.2} {}", UNITS[unit])
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
-    use super::{backup_path, format_bytes, restore_staging_path};
+    use super::{MarkerFile, backup_path, format_bytes, restore_staging_path, write_marker_file};
     use std::path::Path;
     use uuid::Uuid;
 
@@ -695,5 +1001,35 @@ mod tests {
     #[test]
     fn formats_sizes_for_user_messages() {
         assert_eq!(format_bytes(1024), "1.00 KB");
+    }
+
+    #[test]
+    fn marker_file_round_trips() {
+        let dir = std::env::temp_dir().join(format!("dirmover-marker-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let move_id = Uuid::new_v4();
+        let source = Path::new(r"C:\test\src");
+        let dest = Path::new(r"D:\test\dst");
+        write_marker_file(&dir, move_id, source, dest).unwrap();
+
+        let content = std::fs::read_to_string(dir.join(".dirmover-migration.json")).unwrap();
+        let marker: MarkerFile = serde_json::from_str(&content).unwrap();
+        assert_eq!(marker.move_id, move_id.to_string());
+        assert_eq!(marker.source, source.to_string_lossy());
+        assert_eq!(marker.destination, dest.to_string_lossy());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn marker_file_rejects_wrong_move_id() {
+        let dir = std::env::temp_dir().join(format!("dirmover-marker2-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        write_marker_file(&dir, id1, Path::new("src"), Path::new("dst")).unwrap();
+        let content = std::fs::read_to_string(dir.join(".dirmover-migration.json")).unwrap();
+        let marker: MarkerFile = serde_json::from_str(&content).unwrap();
+        assert_ne!(marker.move_id, id2.to_string());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

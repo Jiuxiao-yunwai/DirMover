@@ -9,6 +9,7 @@ use crate::{
 use chrono::Utc;
 use std::{
     fs,
+    os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -383,10 +384,10 @@ enum MeasureEntry {
 }
 
 fn measure_entry(path: &Path) -> AppResult<MeasureEntry> {
-    if platform::is_reparse_point(path)? {
+    let metadata = fs::symlink_metadata(path)?;
+    if platform::is_reparse_point_from_attributes(metadata.file_attributes()) {
         return Ok(MeasureEntry::Link);
     }
-    let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() {
         Ok(MeasureEntry::Directory)
     } else {

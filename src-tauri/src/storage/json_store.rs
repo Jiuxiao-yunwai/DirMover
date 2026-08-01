@@ -239,6 +239,9 @@ mod tests {
             destination: r"D:\target".to_string(),
             backup_path: None,
             created_at_utc: Utc::now(),
+            destination_file_id: None,
+            destination_volume_serial: None,
+            final_sync_attempts: None,
             stage: "Preparing".to_string(),
         };
         storage.add_move(record.clone()).expect("move should save");

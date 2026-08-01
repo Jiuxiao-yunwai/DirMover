@@ -26,6 +26,7 @@ pub fn start_migration(
     let task_id = task.id;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _lock = state.lock_migration_arc();
         let progress = progress_emitter(state.clone(), task_id, on_event.clone());
         match migration::move_directory(
             state.storage(),
@@ -71,6 +72,7 @@ pub fn start_restore(
     let task_id = task.id;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _lock = state.lock_migration_arc();
         let progress = progress_emitter(state.clone(), task_id, on_event.clone());
         match migration::restore_directory(state.storage(), record_id, &cancellation, &progress) {
             Ok(outcome) => {

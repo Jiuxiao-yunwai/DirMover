@@ -17,6 +17,7 @@ pub struct AppState {
     storage: Storage,
     tasks: Arc<TaskRegistry>,
     scans: Arc<Mutex<ScanCache>>,
+    migration_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -31,6 +32,7 @@ impl AppState {
             storage: Storage::discover()?,
             tasks: Arc::new(TaskRegistry::default()),
             scans: Arc::new(Mutex::new(ScanCache::default())),
+            migration_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -40,6 +42,12 @@ impl AppState {
 
     pub fn tasks(&self) -> &TaskRegistry {
         &self.tasks
+    }
+
+    /// Return the migration lock Arc so it can be moved into spawn_blocking.
+    /// Only one migration (move or restore) may run at a time.
+    pub fn lock_migration_arc(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.migration_lock)
     }
 
     pub fn insert_scan(&self, snapshot: ScanSnapshot) -> AppResult<Uuid> {

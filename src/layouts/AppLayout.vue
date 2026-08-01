@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
 import NavIcon from "@/components/base/NavIcon.vue";
-import type { ThemePreference } from "@/types/domain";
+import type { BootstrapData, ThemePreference } from "@/types/domain";
 
 export type ViewKey = "space" | "moves" | "links" | "settings" | "help";
 type NavIconName = "space" | "moves" | "links" | "settings" | "help";
 
 defineProps<{
+  bootstrap: BootstrapData;
   activeView: ViewKey;
   isAdministrator: boolean;
   theme: ThemePreference;
@@ -56,6 +57,7 @@ watch(collapsed, (value) => {
         </button>
         <div class="brand-copy">
           <strong>DirMover</strong>
+          <span class="version-label">v{{ bootstrap.version }}</span>
         </div>
         <button
           class="collapse-toggle"
@@ -119,7 +121,7 @@ watch(collapsed, (value) => {
         <span class="status-dot" :class="{ busy }" />
         <span>{{ status }}</span>
         <span class="status-spacer" />
-        <span>Tauri 2 · Rust</span>
+        <span>v{{ bootstrap.version }} · Tauri 2 · Rust</span>
       </footer>
     </section>
   </div>
@@ -218,6 +220,12 @@ watch(collapsed, (value) => {
 .brand strong {
   font-size: 15px;
   font-weight: 650;
+}
+
+.version-label {
+  color: var(--text-disabled);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .collapsed .theme-control,

@@ -65,6 +65,7 @@ export type FolderRow = {
 };
 
 export type BootstrapData = {
+  version: string;
   settings: AppSettings;
   managedLocations: ManagedCategoryRow[];
   drives: DriveInfo[];

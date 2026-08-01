@@ -24,6 +24,7 @@ pub struct ScanPreset {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapData {
+    pub version: String,
     pub settings: AppSettingsDto,
     pub managed_locations: Vec<ManagedCategoryRow>,
     pub drives: Vec<DriveInfo>,

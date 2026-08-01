@@ -101,6 +101,7 @@ function suppressNativeContextMenu(event: MouseEvent): void {
 
   <AppLayout
     v-else
+    :bootstrap="bootstrap"
     :active-view="activeView"
     :is-administrator="bootstrap.isAdministrator"
     :theme="theme"

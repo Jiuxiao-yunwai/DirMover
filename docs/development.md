@@ -29,8 +29,8 @@
 当前周期：
 
 ```text
-main     2.1.2
-develop  2.2.0-dev.7
+main     2.2.0
+develop  2.2.0
 目标     2.2.0
 ```
 

@@ -8,16 +8,17 @@ DirMover 是一个轻量、高性能的 Windows 目录空间分析与安全迁�
 
 前往 [Releases](https://github.com/Jiuxiao-yunwai/DirMover/releases/latest) 下载最新版本。当前仅提供 Windows x64 版本，建议使用 Windows 10 或 Windows 11。
 
-同一版本提供两种安装包，应用功能完全相同，请选择其中一种安装，不要同时安装：
+同一版本提供两种安装包和一个免安装版本，应用功能完全相同。安装版请选择其中一种，不要同时安装：
 
-| 安装包 | 默认安装位置 | 权限 | 适用场景 |
+| 下载文件 | 默认位置 | 权限 | 适用场景 |
 | --- | --- | --- | --- |
 | `DirMover_*_x64-setup.exe` | `%LOCALAPPDATA%\DirMover` | 无需管理员权限 | 推荐普通用户使用 |
 | `DirMover_*_x64_zh-CN.msi` | `C:\Program Files\DirMover` | 需要管理员权限 | 企业部署、组策略或标准 MSI 管理 |
+| `DirMover_*_portable.exe` | 无固定位置 | 无需安装 | 直接运行、U 盘携带或临时测试 |
 
 安装步骤：
 
-1. 从 Releases 下载所需安装包。
+1. 从 Releases 下载所需安装包；免安装版下载后可直接运行。
 2. 退出正在运行的旧版 DirMover。
 3. 双击安装包并按照中文向导完成安装。
 4. 后续升级建议继续使用同一种安装包；如果需要在 EXE 与 MSI 之间切换，请先卸载原版本。

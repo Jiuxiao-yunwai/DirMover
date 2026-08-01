@@ -12,9 +12,9 @@ Before changing files, check `git status --short --branch` and the current versi
 
 Current development cycle:
 
-- Stable version on `main`: `2.1.2`
+- Stable version on `main`: `2.2.0`
 - Development branch: `develop`
-- Current development version: `2.2.0-dev.7`
+- Current development version: `2.2.0`
 - Target release: `2.2.0`
 
 See `docs/development.md` for the full branch, version, and release workflow.

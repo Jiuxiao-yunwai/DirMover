@@ -24,21 +24,31 @@ if (-not $SkipBuild) {
     }
 }
 
-$installers = @(
-    Join-Path $buildRoot "release\bundle\nsis\DirMover_${version}_x64-setup.exe"
-    Join-Path $buildRoot "release\bundle\msi\DirMover_${version}_x64_zh-CN.msi"
+$releaseFiles = @(
+    @{
+        Source = Join-Path $buildRoot "release\bundle\nsis\DirMover_${version}_x64-setup.exe"
+        Name = "DirMover_${version}_x64-setup.exe"
+    }
+    @{
+        Source = Join-Path $buildRoot "release\bundle\msi\DirMover_${version}_x64_zh-CN.msi"
+        Name = "DirMover_${version}_x64_zh-CN.msi"
+    }
+    @{
+        Source = Join-Path $buildRoot "release\dirmover.exe"
+        Name = "DirMover_${version}_portable.exe"
+    }
 )
 
-foreach ($installer in $installers) {
-    if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
-        throw "Installer not found: $installer"
+foreach ($file in $releaseFiles) {
+    if (-not (Test-Path -LiteralPath $file.Source -PathType Leaf)) {
+        throw "Release artifact not found: $($file.Source)"
     }
 }
 
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
-foreach ($installer in $installers) {
-    Copy-Item -LiteralPath $installer -Destination $releaseRoot -Force
+foreach ($file in $releaseFiles) {
+    Copy-Item -LiteralPath $file.Source -Destination (Join-Path $releaseRoot $file.Name) -Force
 }
 
-Write-Host "Installers are ready in: $releaseRoot"
+Write-Host "Release artifacts are ready in: $releaseRoot"
 Get-ChildItem -LiteralPath $releaseRoot -File | Select-Object Name, Length

@@ -11,11 +11,11 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::HANDLE,
+        Foundation::{ERROR_SUCCESS, GetLastError, HANDLE},
         Storage::FileSystem::{
-            FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, GetDiskFreeSpaceExW, GetDriveTypeW,
-            GetFileAttributesW, GetVolumeInformationW, MOVEFILE_REPLACE_EXISTING,
-            MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileAttributesW,
+            FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, GetCompressedFileSizeW,
+            GetDiskFreeSpaceExW, GetDriveTypeW, GetFileAttributesW, GetVolumeInformationW,
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileAttributesW,
         },
         System::{
             IO::DeviceIoControl,
@@ -34,6 +34,21 @@ const SHARE_ALL: u32 = 0x0000_0007;
 pub fn is_administrator() -> bool {
     // SAFETY: IsUserAnAdmin has no parameters and does not retain state.
     unsafe { IsUserAnAdmin().as_bool() }
+}
+
+pub fn allocated_size(path: &Path) -> AppResult<u64> {
+    let path = HSTRING::from(path.as_os_str());
+    let mut high = 0_u32;
+    // SAFETY: The path and high-word pointer remain valid for the duration of the call.
+    let low = unsafe { GetCompressedFileSizeW(&path, Some(&raw mut high)) };
+    if low == u32::MAX {
+        // A valid size can also end in 0xFFFF_FFFF, so only a non-success last error is fatal.
+        let error = unsafe { GetLastError() };
+        if error != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(error.0 as i32).into());
+        }
+    }
+    Ok((u64::from(high) << 32) | u64::from(low))
 }
 
 pub fn fixed_ntfs_drives() -> Vec<DriveInfo> {

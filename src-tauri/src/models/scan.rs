@@ -74,16 +74,41 @@ pub struct ScanSnapshot {
     pub root: String,
     pub folders: Vec<FolderRow>,
     pub links: Vec<LinkRow>,
+    pub root_bytes: u64,
+    pub root_allocated_bytes: u64,
+    pub root_files: u64,
     pub engine: String,
     pub created_at_utc: DateTime<Utc>,
+}
+
+impl ScanSnapshot {
+    pub fn total_bytes(&self) -> u64 {
+        self.folders.iter().fold(self.root_bytes, |total, item| {
+            total.saturating_add(item.bytes)
+        })
+    }
+
+    pub fn total_allocated_bytes(&self) -> u64 {
+        self.folders
+            .iter()
+            .fold(self.root_allocated_bytes, |total, item| {
+                total.saturating_add(item.allocated_bytes)
+            })
+    }
+
+    pub fn total_files(&self) -> u64 {
+        self.folders.iter().fold(self.root_files, |total, item| {
+            total.saturating_add(item.file_count)
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SortField {
+    #[default]
     Name,
     Bytes,
-    #[default]
     AllocatedBytes,
     FileCount,
     Status,
@@ -92,8 +117,8 @@ pub enum SortField {
 #[derive(Clone, Copy, Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SortDirection {
-    Ascending,
     #[default]
+    Ascending,
     Descending,
 }
 
@@ -131,7 +156,11 @@ impl Default for ScanQuery {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkRecord, LinkRow};
+    use super::{
+        FolderRow, LinkRecord, LinkRow, ScanQuery, ScanSnapshot, SortDirection, SortField,
+    };
+    use chrono::Utc;
+    use uuid::Uuid;
 
     #[test]
     fn separates_legacy_link_storage_from_camel_case_ipc() {
@@ -148,6 +177,44 @@ mod tests {
         let value = serde_json::to_value(row).expect("IPC row should serialize");
         assert_eq!(value["path"], r"C:\source");
         assert!(value.get("Path").is_none());
+    }
+
+    #[test]
+    fn scan_totals_include_files_stored_directly_in_the_root() {
+        let snapshot = ScanSnapshot {
+            id: Uuid::nil(),
+            root: r"C:\root".to_string(),
+            folders: vec![FolderRow {
+                name: "child".to_string(),
+                full_path: r"C:\root\child".to_string(),
+                bytes: 100,
+                allocated_bytes: 128,
+                file_count: 2,
+                link_count: 0,
+                error_count: 0,
+                is_link: false,
+                link_target: None,
+                note: String::new(),
+                measured: true,
+            }],
+            links: Vec::new(),
+            root_bytes: 50,
+            root_allocated_bytes: 64,
+            root_files: 1,
+            engine: "test".to_string(),
+            created_at_utc: Utc::now(),
+        };
+
+        assert_eq!(snapshot.total_bytes(), 150);
+        assert_eq!(snapshot.total_allocated_bytes(), 192);
+        assert_eq!(snapshot.total_files(), 3);
+    }
+
+    #[test]
+    fn scan_query_defaults_to_name_ascending() {
+        let query = ScanQuery::default();
+        assert!(matches!(query.sort_field, SortField::Name));
+        assert!(matches!(query.sort_direction, SortDirection::Ascending));
     }
 }
 

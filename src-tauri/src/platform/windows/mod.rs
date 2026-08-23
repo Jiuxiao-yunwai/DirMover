@@ -8,6 +8,6 @@ pub use links::{
 };
 pub use mft::scan_mft_children;
 pub use system::{
-    drive_info, fixed_ntfs_drives, is_administrator, mark_hidden, open_in_file_manager,
-    physical_disk_location, relaunch_elevated, replace_file,
+    allocated_size, drive_info, fixed_ntfs_drives, is_administrator, mark_hidden,
+    open_in_file_manager, physical_disk_location, relaunch_elevated, replace_file,
 };

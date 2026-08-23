@@ -5,9 +5,10 @@ mod windows;
 
 #[cfg(windows)]
 pub use windows::{
-    create_junction, drive_info, fixed_ntfs_drives, is_administrator, is_reparse_point,
-    is_reparse_point_from_attributes, link_target, mark_hidden, open_in_file_manager,
-    physical_disk_location, relaunch_elevated, remove_junction, replace_file, scan_mft_children,
+    allocated_size, create_junction, drive_info, fixed_ntfs_drives, is_administrator,
+    is_reparse_point, is_reparse_point_from_attributes, link_target, mark_hidden,
+    open_in_file_manager, physical_disk_location, relaunch_elevated, remove_junction, replace_file,
+    scan_mft_children,
 };
 
 #[cfg(not(windows))]
@@ -20,6 +21,10 @@ mod portable {
 
     pub fn is_reparse_point_from_attributes(_attributes: u32) -> bool {
         false
+    }
+
+    pub fn allocated_size(path: &Path) -> AppResult<u64> {
+        Ok(std::fs::metadata(path)?.len())
     }
 
     pub fn is_administrator() -> bool {

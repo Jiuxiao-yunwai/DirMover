@@ -157,6 +157,9 @@ pub fn query_scan_result(
             .take(page_size)
             .collect::<Vec<_>>()
     };
+    let total_bytes = snapshot.total_bytes();
+    let total_allocated_bytes = snapshot.total_allocated_bytes();
+    let total_files = snapshot.total_files();
     Ok(ScanPage {
         result_id,
         root: snapshot.root,
@@ -166,13 +169,9 @@ pub fn query_scan_result(
         total_items,
         page,
         page_size,
-        total_bytes: snapshot.folders.iter().map(|item| item.bytes).sum(),
-        total_allocated_bytes: snapshot
-            .folders
-            .iter()
-            .map(|item| item.allocated_bytes)
-            .sum(),
-        total_files: snapshot.folders.iter().map(|item| item.file_count).sum(),
+        total_bytes,
+        total_allocated_bytes,
+        total_files,
     })
 }
 

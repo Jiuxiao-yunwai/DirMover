@@ -131,6 +131,9 @@ pub fn scan_children(
                     root: root.to_string_lossy().into_owned(),
                     folders,
                     links,
+                    root_bytes: mft.root_logical_bytes,
+                    root_allocated_bytes: mft.root_allocated_bytes,
+                    root_files: mft.root_files,
                     engine: "NTFS MFT".to_string(),
                     created_at_utc: Utc::now(),
                 });
@@ -154,6 +157,7 @@ pub fn scan_children_by_enumeration(
     progress: &(dyn Fn(ScanProgress) + Send + Sync),
 ) -> AppResult<ScanSnapshot> {
     let directories = list_child_paths(root)?;
+    let root_stats = measure_direct_files(root, cancellation);
     let total = directories.len();
     let next = AtomicUsize::new(0);
     let completed = AtomicUsize::new(0);
@@ -219,6 +223,9 @@ pub fn scan_children_by_enumeration(
         root: root.to_string_lossy().into_owned(),
         folders: rows,
         links,
+        root_bytes: root_stats.bytes,
+        root_allocated_bytes: root_stats.allocated_bytes,
+        root_files: root_stats.files,
         engine: "兼容模式".to_string(),
         created_at_utc: Utc::now(),
     })
@@ -253,13 +260,57 @@ pub fn measure(root: &Path, cancellation: &CancellationFlag) -> FolderStats {
             match measure_entry(&path) {
                 Ok(MeasureEntry::Link) => stats.links += 1,
                 Ok(MeasureEntry::Directory) => stack.push(path),
-                Ok(MeasureEntry::File(bytes)) => {
+                Ok(MeasureEntry::File {
+                    bytes,
+                    allocated_bytes,
+                    is_link,
+                }) => {
                     stats.bytes = stats.bytes.saturating_add(bytes);
-                    stats.allocated_bytes = stats.allocated_bytes.saturating_add(bytes);
+                    stats.allocated_bytes = stats.allocated_bytes.saturating_add(allocated_bytes);
                     stats.files += 1;
+                    stats.links = stats.links.saturating_add(u64::from(is_link));
                 }
                 Err(_) => stats.errors += 1,
             }
+        }
+    }
+    stats
+}
+
+fn measure_direct_files(root: &Path, cancellation: &CancellationFlag) -> FolderStats {
+    let mut stats = FolderStats::default();
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => {
+            stats.errors = 1;
+            return stats;
+        }
+    };
+    for entry in entries {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                stats.errors = stats.errors.saturating_add(1);
+                continue;
+            }
+        };
+        match measure_entry(&entry.path()) {
+            Ok(MeasureEntry::File {
+                bytes,
+                allocated_bytes,
+                is_link,
+            }) => {
+                stats.bytes = stats.bytes.saturating_add(bytes);
+                stats.allocated_bytes = stats.allocated_bytes.saturating_add(allocated_bytes);
+                stats.files = stats.files.saturating_add(1);
+                stats.links = stats.links.saturating_add(u64::from(is_link));
+            }
+            Ok(MeasureEntry::Link) => stats.links = stats.links.saturating_add(1),
+            Ok(MeasureEntry::Directory) => {}
+            Err(_) => stats.errors = stats.errors.saturating_add(1),
         }
     }
     stats
@@ -317,9 +368,10 @@ fn list_child_paths(root: &Path) -> AppResult<Vec<PathBuf>> {
             Err(_) => continue,
         };
         let path = entry.path();
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
-            || platform::is_reparse_point(&path).unwrap_or(false)
-        {
+        let is_directory = fs::symlink_metadata(&path)
+            .map(|metadata| metadata.is_dir() || metadata.file_attributes() & 0x10 != 0)
+            .unwrap_or(false);
+        if is_directory {
             paths.push(path);
         }
     }
@@ -380,18 +432,30 @@ fn scan_top_folder(
 enum MeasureEntry {
     Link,
     Directory,
-    File(u64),
+    File {
+        bytes: u64,
+        allocated_bytes: u64,
+        is_link: bool,
+    },
 }
 
 fn measure_entry(path: &Path) -> AppResult<MeasureEntry> {
     let metadata = fs::symlink_metadata(path)?;
-    if platform::is_reparse_point_from_attributes(metadata.file_attributes()) {
-        return Ok(MeasureEntry::Link);
-    }
-    if metadata.is_dir() {
-        Ok(MeasureEntry::Directory)
+    let attributes = metadata.file_attributes();
+    let is_reparse = platform::is_reparse_point_from_attributes(attributes);
+    let is_directory = metadata.is_dir() || attributes & 0x10 != 0;
+    if is_directory {
+        if is_reparse {
+            Ok(MeasureEntry::Link)
+        } else {
+            Ok(MeasureEntry::Directory)
+        }
     } else {
-        Ok(MeasureEntry::File(metadata.len()))
+        Ok(MeasureEntry::File {
+            bytes: metadata.len(),
+            allocated_bytes: platform::allocated_size(path).unwrap_or(metadata.len()),
+            is_link: is_reparse,
+        })
     }
 }
 

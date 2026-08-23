@@ -44,6 +44,9 @@ pub struct MftFolder {
 pub struct MftScan {
     pub folders: Vec<MftFolder>,
     pub links: Vec<(PathBuf, bool)>,
+    pub root_logical_bytes: u64,
+    pub root_allocated_bytes: u64,
+    pub root_files: u64,
 }
 
 #[repr(C)]
@@ -74,6 +77,7 @@ struct DataRun {
 
 #[derive(Clone, Debug)]
 struct ParsedRecord {
+    base_id: i64,
     parent_id: i64,
     name: Option<String>,
     is_directory: bool,
@@ -103,6 +107,20 @@ struct ParentAggregate {
     logical_bytes: u64,
     allocated_bytes: u64,
     files: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FileNode {
+    parent_id: i64,
+    logical_bytes: u64,
+    allocated_bytes: u64,
+}
+
+impl FileNode {
+    fn merge_sizes(&mut self, logical_bytes: u64, allocated_bytes: u64) {
+        self.logical_bytes = self.logical_bytes.max(logical_bytes);
+        self.allocated_bytes = self.allocated_bytes.max(allocated_bytes);
+    }
 }
 
 pub fn scan_mft_children(
@@ -135,7 +153,8 @@ pub fn scan_mft_children(
     validate_volume_data(&data)?;
     let runs = read_mft_runs(&volume, &data)?;
     let mut directories = HashMap::default();
-    let mut files_by_parent = HashMap::<i64, ParentAggregate>::default();
+    let mut files = HashMap::<i64, FileNode>::default();
+    let mut extension_sizes = HashMap::<i64, FileNode>::default();
     let mut links = Vec::new();
 
     read_records(
@@ -157,20 +176,27 @@ pub fn scan_mft_children(
                 }
                 return;
             }
-            if record.is_reparse {
-                if record.parent_id == root_id
-                    && let Some(name) = record.name
-                {
-                    links.push((root.join(name), false));
-                }
+            if record.base_id != 0 {
+                extension_sizes
+                    .entry(record.base_id)
+                    .or_default()
+                    .merge_sizes(record.logical_bytes, record.allocated_bytes);
                 return;
             }
-            let aggregate = files_by_parent.entry(record.parent_id).or_default();
-            aggregate.logical_bytes = aggregate.logical_bytes.saturating_add(record.logical_bytes);
-            aggregate.allocated_bytes = aggregate
-                .allocated_bytes
-                .saturating_add(record.allocated_bytes);
-            aggregate.files = aggregate.files.saturating_add(1);
+            if record.is_reparse
+                && record.parent_id == root_id
+                && let Some(name) = record.name
+            {
+                links.push((root.join(name), false));
+            }
+            files.insert(
+                id,
+                FileNode {
+                    parent_id: record.parent_id,
+                    logical_bytes: record.logical_bytes,
+                    allocated_bytes: record.allocated_bytes,
+                },
+            );
         },
         |value| {
             progress(ScanProgress {
@@ -187,9 +213,26 @@ pub fn scan_mft_children(
         message: "正在汇总目录占用…".to_string(),
     });
 
+    for (base_id, extension) in extension_sizes {
+        if let Some(file) = files.get_mut(&base_id) {
+            file.merge_sizes(extension.logical_bytes, extension.allocated_bytes);
+        }
+    }
+
+    let mut files_by_parent = HashMap::<i64, ParentAggregate>::default();
+    for file in files.into_values() {
+        let aggregate = files_by_parent.entry(file.parent_id).or_default();
+        aggregate.logical_bytes = aggregate.logical_bytes.saturating_add(file.logical_bytes);
+        aggregate.allocated_bytes = aggregate
+            .allocated_bytes
+            .saturating_add(file.allocated_bytes);
+        aggregate.files = aggregate.files.saturating_add(1);
+    }
+
     let mut top_by_directory = HashMap::default();
     top_by_directory.insert(root_id, 0_i64);
     let mut aggregates = HashMap::default();
+    let mut root_stats = ParentAggregate::default();
     for (id, directory) in &directories {
         if directory.parent_id == root_id {
             aggregates.insert(
@@ -217,6 +260,14 @@ pub fn scan_mft_children(
                 phase: "mft-aggregate".to_string(),
                 message: "正在汇总目录占用…".to_string(),
             });
+        }
+        if parent_id == root_id {
+            root_stats.logical_bytes = root_stats.logical_bytes.saturating_add(stats.logical_bytes);
+            root_stats.allocated_bytes = root_stats
+                .allocated_bytes
+                .saturating_add(stats.allocated_bytes);
+            root_stats.files = root_stats.files.saturating_add(stats.files);
+            continue;
         }
         let top = resolve_top(parent_id, root_id, &directories, &mut top_by_directory);
         let Some(aggregate) = aggregates.get_mut(&top) else {
@@ -247,6 +298,9 @@ pub fn scan_mft_children(
             })
             .collect(),
         links,
+        root_logical_bytes: root_stats.logical_bytes,
+        root_allocated_bytes: root_stats.allocated_bytes,
+        root_files: root_stats.files,
     })
 }
 
@@ -426,9 +480,12 @@ fn parse_record(record: &[u8]) -> Option<ParsedRecord> {
     }
 
     let mut is_directory = flags & 2 != 0;
+    let base_id = read_i64(record, 32).ok()? & RECORD_NUMBER_MASK;
     let mut name_span = None;
     let mut parent_id = 0_i64;
     let mut file_attributes = 0_u32;
+    let mut file_name_logical_bytes = 0_u64;
+    let mut file_name_allocated_bytes = 0_u64;
     let mut has_reparse_attribute = false;
     let mut best_namespace = -1_i32;
     let mut logical_bytes = 0_u64;
@@ -466,20 +523,32 @@ fn parse_record(record: &[u8]) -> Option<ParsedRecord> {
                 if score > best_namespace && 66 + name_length * 2 <= value_length {
                     name_span = Some((value + 66, name_length));
                     parent_id = read_i64(record, value).ok()? & RECORD_NUMBER_MASK;
+                    file_name_allocated_bytes =
+                        u64::try_from(read_i64(record, value + 40).ok()?.max(0)).ok()?;
+                    file_name_logical_bytes =
+                        u64::try_from(read_i64(record, value + 48).ok()?.max(0)).ok()?;
                     file_attributes = read_u32(record, value + 56).ok()?;
                     best_namespace = score;
                 }
             }
         } else if attribute_type == ATTRIBUTE_DATA && attribute_name_length == 0 {
             if non_resident && length >= 64 {
-                allocated_bytes = u64::try_from(read_i64(record, offset + 40).ok()?.max(0)).ok()?;
-                logical_bytes = u64::try_from(read_i64(record, offset + 48).ok()?.max(0)).ok()?;
+                allocated_bytes = allocated_bytes
+                    .max(u64::try_from(read_i64(record, offset + 40).ok()?.max(0)).ok()?);
+                logical_bytes = logical_bytes
+                    .max(u64::try_from(read_i64(record, offset + 48).ok()?.max(0)).ok()?);
             } else if !non_resident && length >= 24 {
-                logical_bytes = u64::from(read_u32(record, offset + 16).ok()?);
-                allocated_bytes = logical_bytes;
+                let resident_bytes = u64::from(read_u32(record, offset + 16).ok()?);
+                logical_bytes = logical_bytes.max(resident_bytes);
+                allocated_bytes = allocated_bytes.max(resident_bytes);
             }
         }
         offset += length;
+    }
+
+    if logical_bytes == 0 && allocated_bytes == 0 {
+        logical_bytes = file_name_logical_bytes;
+        allocated_bytes = file_name_allocated_bytes;
     }
 
     is_directory |= file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
@@ -498,6 +567,7 @@ fn parse_record(record: &[u8]) -> Option<ParsedRecord> {
         None
     };
     Some(ParsedRecord {
+        base_id,
         parent_id,
         name,
         is_directory,
@@ -729,7 +799,7 @@ fn windows_error(error: windows::core::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DataRun, decode_runs, parse_record};
+    use super::{DataRun, FileNode, decode_runs, parse_record};
 
     #[test]
     fn decodes_relative_ntfs_data_runs() {
@@ -782,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_file_name_allocation_for_regular_files() {
+    fn falls_back_to_file_name_sizes_when_data_is_in_an_extension_record() {
         let mut record = vec![0_u8; 192];
         record[..4].copy_from_slice(b"FILE");
         record[20..22].copy_from_slice(&48_u16.to_le_bytes());
@@ -794,6 +864,8 @@ mod tests {
         record[file_name + 16..file_name + 20].copy_from_slice(&68_u32.to_le_bytes());
         record[file_name + 20..file_name + 22].copy_from_slice(&24_u16.to_le_bytes());
         record[file_name + 24..file_name + 32].copy_from_slice(&42_i64.to_le_bytes());
+        record[file_name + 24 + 40..file_name + 24 + 48].copy_from_slice(&8192_i64.to_le_bytes());
+        record[file_name + 24 + 48..file_name + 24 + 56].copy_from_slice(&7000_i64.to_le_bytes());
         record[file_name + 24 + 64] = 1;
         record[file_name + 24 + 65] = 1;
         record[file_name + 24 + 66..file_name + 24 + 68]
@@ -805,5 +877,44 @@ mod tests {
         assert!(!parsed.is_directory);
         assert!(!parsed.is_reparse);
         assert_eq!(parsed.name, None);
+        assert_eq!(parsed.logical_bytes, 7000);
+        assert_eq!(parsed.allocated_bytes, 8192);
+    }
+
+    #[test]
+    fn reads_base_reference_and_sizes_from_extension_records() {
+        let mut record = vec![0_u8; 160];
+        record[..4].copy_from_slice(b"FILE");
+        record[20..22].copy_from_slice(&48_u16.to_le_bytes());
+        record[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        record[32..40].copy_from_slice(&77_i64.to_le_bytes());
+
+        let data = 48;
+        record[data..data + 4].copy_from_slice(&0x80_u32.to_le_bytes());
+        record[data + 4..data + 8].copy_from_slice(&64_u32.to_le_bytes());
+        record[data + 8] = 1;
+        record[data + 40..data + 48].copy_from_slice(&16384_i64.to_le_bytes());
+        record[data + 48..data + 56].copy_from_slice(&15000_i64.to_le_bytes());
+        record[data + 64..data + 68].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let parsed = parse_record(&record).expect("extension record should parse");
+        assert_eq!(parsed.base_id, 77);
+        assert_eq!(parsed.logical_bytes, 15000);
+        assert_eq!(parsed.allocated_bytes, 16384);
+    }
+
+    #[test]
+    fn extension_sizes_expand_but_never_double_count_a_file() {
+        let mut file = FileNode {
+            parent_id: 42,
+            logical_bytes: 7000,
+            allocated_bytes: 8192,
+        };
+        file.merge_sizes(15000, 16384);
+        file.merge_sizes(0, 0);
+
+        assert_eq!(file.parent_id, 42);
+        assert_eq!(file.logical_bytes, 15000);
+        assert_eq!(file.allocated_bytes, 16384);
     }
 }

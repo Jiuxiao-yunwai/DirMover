@@ -108,7 +108,7 @@ watch(collapsed, (value) => {
         </label>
         <div class="engine-state">
           <span class="state-dot" :class="{ admin: isAdministrator }" />
-          {{ isAdministrator ? "管理员模式 · MFT 可用" : "普通模式 · 扫描时提权" }}
+          {{ isAdministrator ? "管理员模式" : "普通模式" }}
         </div>
       </div>
     </aside>
@@ -121,7 +121,7 @@ watch(collapsed, (value) => {
         <span class="status-dot" :class="{ busy }" />
         <span>{{ status }}</span>
         <span class="status-spacer" />
-        <span>v{{ bootstrap.version }} · Tauri 2 · Rust</span>
+        <span>v{{ bootstrap.version }}</span>
       </footer>
     </section>
   </div>
@@ -144,10 +144,11 @@ watch(collapsed, (value) => {
   grid-template-rows: auto 1fr auto;
   min-width: 0;
   overflow: hidden;
-  padding: var(--space-3);
+  padding: var(--space-3) var(--space-3) 0;
   border-right: 1px solid var(--border-subtle);
   background: var(--surface-sidebar);
   contain: layout paint;
+  user-select: none;
 }
 
 .collapsed .sidebar {
@@ -224,7 +225,9 @@ watch(collapsed, (value) => {
 
 .version-label {
   color: var(--text-disabled);
+  cursor: text;
   font-size: 11px;
+  user-select: text;
   white-space: nowrap;
 }
 
@@ -288,6 +291,7 @@ nav button {
   border-radius: var(--radius-small);
   color: var(--text-secondary);
   background: transparent;
+  cursor: pointer;
   text-align: left;
   white-space: nowrap;
   transition:
@@ -303,6 +307,7 @@ nav button {
 }
 
 nav button:hover {
+  color: var(--text-primary);
   background: var(--surface-hover);
 }
 
@@ -326,6 +331,10 @@ nav strong {
   transition: color var(--duration-fast) var(--ease-standard);
 }
 
+nav button:hover .nav-icon {
+  color: var(--text-primary);
+}
+
 nav button.active .nav-icon {
   color: var(--accent);
 }
@@ -344,8 +353,8 @@ nav button.active .nav-icon {
 
 .sidebar-footer {
   display: grid;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-2) var(--space-1);
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-2) 0;
   border-top: 1px solid var(--border-subtle);
 }
 
@@ -364,11 +373,16 @@ select {
   border-radius: var(--radius-small);
   color: var(--text-primary);
   background: var(--surface-primary);
+  cursor: pointer;
 }
 
 .engine-state {
+  display: flex;
+  height: var(--status-height);
+  align-items: center;
   color: var(--text-secondary);
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .collapse-toggle {
@@ -382,6 +396,7 @@ select {
   border-radius: var(--radius-small);
   color: var(--text-secondary);
   background: transparent;
+  cursor: pointer;
   opacity: 1;
   transform: scale(1);
   transition: background var(--duration-fast) var(--ease-standard);

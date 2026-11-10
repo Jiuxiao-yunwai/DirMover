@@ -3,7 +3,8 @@ import { computed, ref, shallowRef, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import BaseButton from "@/components/base/BaseButton.vue";
 import BaseDialog from "@/components/base/BaseDialog.vue";
-import BaseProgress from "@/components/base/BaseProgress.vue";
+import TaskProgress from "@/components/business/TaskProgress.vue";
+import { mergeTaskState } from "@/utils/taskState";
 import MoveTable from "@/components/business/MoveTable.vue";
 import { api } from "@/services/api";
 import { normalizeAppError } from "@/services/tauri";
@@ -22,35 +23,45 @@ const rows = shallowRef<MoveRow[]>(props.bootstrap.moves);
 const selected = ref<MoveRow | null>(null);
 const activeTask = shallowRef<TaskDescriptor | null>(null);
 const confirmRestoreOpen = ref(false);
+const pendingAction = ref<"refresh" | "restore" | "recover" | null>(null);
+const cancelling = ref(false);
+let rowsRevision = 0;
 
 watch(
   () => props.bootstrap.moves,
   (moves) => {
+    rowsRevision += 1;
     rows.value = moves;
-    if (selected.value && !moves.some((move) => move.id === selected.value?.id)) {
-      selected.value = null;
-    }
+    if (selected.value) selected.value = moves.find((move) => move.id === selected.value?.id) ?? null;
   },
 );
 
-const busy = computed(() =>
+const taskActive = computed(() =>
   ["queued", "running"].includes(activeTask.value?.state ?? ""),
 );
+const busy = computed(() => pendingAction.value !== null || taskActive.value);
+watch(busy, (value) => emit("busy", value), { flush: "sync" });
 
 const refresh = async (): Promise<void> => {
-  emit("busy", true);
+  if (busy.value) return;
+  pendingAction.value = "refresh";
+  const revision = rowsRevision;
   emit("status", "正在检查迁移记录…");
   try {
-    rows.value = await api.listMoves();
+    const moves = await api.listMoves();
+    if (revision !== rowsRevision) return;
+    rows.value = moves;
+    if (selected.value) selected.value = moves.find((move) => move.id === selected.value?.id) ?? null;
     emit("status", `已检查 ${rows.value.length} 条迁移记录`);
   } catch (error: unknown) {
     notifyError(error);
   } finally {
-    emit("busy", false);
+    pendingAction.value = null;
   }
 };
 
 const requestRestore = (): void => {
+  if (busy.value) return;
   if (!selected.value) {
     emit("notify", "请先选择一条迁移记录。", "warning");
     return;
@@ -60,47 +71,45 @@ const requestRestore = (): void => {
 
 const restore = async (): Promise<void> => {
   const row = selected.value;
-  if (!row) return;
-  if (!props.bootstrap.isAdministrator) {
-    await elevate();
-    return;
-  }
-  confirmRestoreOpen.value = false;
-  emit("busy", true);
+  if (!row || busy.value) return;
+  pendingAction.value = "restore";
   try {
+    if (!props.bootstrap.isAdministrator) {
+      await elevate();
+      return;
+    }
+    confirmRestoreOpen.value = false;
     activeTask.value = await api.startRestore(row.id, onTaskEvent);
   } catch (error: unknown) {
-    emit("busy", false);
     notifyError(error);
+  } finally {
+    pendingAction.value = null;
   }
 };
 
 const recover = async (): Promise<void> => {
   const row = selected.value;
-  if (!row) return;
-  emit("busy", true);
+  if (!row || busy.value) return;
+  pendingAction.value = "recover";
   try {
     const message = await api.recoverMove(row.id);
     emit("notify", message, "success");
-    emit("refreshData");
-    await refresh();
   } catch (error: unknown) {
     notifyError(error);
   } finally {
-    emit("busy", false);
+    emit("refreshData");
+    pendingAction.value = null;
   }
 };
 
 const onTaskEvent = (event: TaskEvent): void => {
-  activeTask.value = event.task;
+  activeTask.value = mergeTaskState(activeTask.value ?? undefined, event.task);
   emit("status", event.task.message);
   if (event.type === "progress") return;
-  emit("busy", false);
+  if (event.task.runningAtUtc !== null) emit("refreshData");
   if (event.type === "completed") {
     emit("notify", event.summary, "success");
     selected.value = null;
-    emit("refreshData");
-    void refresh();
   } else if (event.type === "failed") {
     emit("notify", event.message, "error");
   } else {
@@ -109,9 +118,16 @@ const onTaskEvent = (event: TaskEvent): void => {
 };
 
 const cancel = async (): Promise<void> => {
-  if (!activeTask.value) return;
-  await api.cancelTask(activeTask.value.id);
-  emit("status", "正在安全停止还原…");
+  if (!activeTask.value?.canCancel || cancelling.value) return;
+  const id = activeTask.value.id;
+  cancelling.value = true;
+  try {
+    const result = await api.cancelTask(id);
+    if (activeTask.value?.id !== id) return;
+    activeTask.value = mergeTaskState(activeTask.value, result);
+    emit("status", activeTask.value.message);
+  } catch (error: unknown) { notifyError(error); }
+  finally { cancelling.value = false; }
 };
 
 const openMove = async (row: MoveRow): Promise<void> => {
@@ -133,6 +149,11 @@ const openStore = async (): Promise<void> => {
   } catch (error: unknown) {
     notifyError(error);
   }
+};
+
+const openDiagnostics = async (): Promise<void> => {
+  try { await api.openDiagnostics(); }
+  catch (error: unknown) { notifyError(error); }
 };
 
 const elevate = async (): Promise<void> => {
@@ -159,7 +180,7 @@ const notifyError = (error: unknown): void => {
     </header>
 
     <div class="toolbar">
-      <BaseButton :disabled="busy" @click="refresh">重新检查</BaseButton>
+      <BaseButton :disabled="busy" :loading="pendingAction === 'refresh'" @click="refresh">重新检查</BaseButton>
       <BaseButton
         variant="primary"
         :disabled="busy || !selected || !selected.status.startsWith('有效')"
@@ -169,20 +190,18 @@ const notifyError = (error: unknown): void => {
       </BaseButton>
       <BaseButton
         :disabled="busy || !selected?.recoveryAvailable"
+        :loading="pendingAction === 'recover'"
         @click="recover"
       >
         恢复中断操作
       </BaseButton>
       <BaseButton :disabled="busy" @click="openStore">打开记录位置</BaseButton>
-      <BaseButton v-if="busy" @click="cancel">停止</BaseButton>
+      <BaseButton @click="openDiagnostics">诊断日志</BaseButton>
+      <BaseButton v-if="taskActive" :disabled="!activeTask?.canCancel || cancelling" @click="cancel">{{ activeTask?.canCancel ? "停止" : activeTask?.cancelRequested ? "正在停止" : "安全收尾中" }}</BaseButton>
     </div>
 
     <div v-if="activeTask?.state === 'queued' || activeTask?.state === 'running'" class="task-progress">
-      <div>
-        <span>{{ activeTask.message }}</span>
-        <strong>{{ activeTask.percentage }}%</strong>
-      </div>
-      <BaseProgress :value="activeTask.percentage" />
+      <TaskProgress :task="activeTask" />
     </div>
 
     <section class="content-panel">
@@ -211,7 +230,7 @@ const notifyError = (error: unknown): void => {
     </dl>
     <template #footer>
       <BaseButton @click="confirmRestoreOpen = false">取消</BaseButton>
-      <BaseButton variant="primary" @click="restore">开始还原</BaseButton>
+      <BaseButton variant="primary" :disabled="busy" :loading="pendingAction === 'restore'" @click="restore">开始还原</BaseButton>
     </template>
   </BaseDialog>
 </template>
@@ -246,6 +265,7 @@ h1 {
 
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
 }
 

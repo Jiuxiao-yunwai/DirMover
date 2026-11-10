@@ -1,9 +1,11 @@
+use super::ProcessFileLock;
 use crate::{
     error::{AppError, AppResult},
     models::{AppSettings, LinkRecord, LinkRow, MoveRecord},
     platform,
 };
 use serde::{Serialize, de::DeserializeOwned};
+use std::time::Duration;
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -12,6 +14,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use uuid::Uuid;
+
+struct StorageGuard<'a> {
+    _process: ProcessFileLock,
+    _local: MutexGuard<'a, ()>,
+}
 
 #[derive(Clone, Debug)]
 pub struct StoragePaths {
@@ -129,10 +136,33 @@ impl Storage {
         write_json_atomic(&self.paths.links, &records)
     }
 
-    fn lock(&self) -> AppResult<MutexGuard<'_, ()>> {
-        self.gate
+    pub fn try_operation_lock(&self) -> AppResult<ProcessFileLock> {
+        ProcessFileLock::acquire(&self.paths.root.join("operation.lock"), Duration::ZERO).map_err(
+            |error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    AppError::Conflict(
+                        "另一个 DirMover 实例正在迁移、还原或恢复，请等待其完成。".to_string(),
+                    )
+                } else {
+                    AppError::Io(error)
+                }
+            },
+        )
+    }
+
+    fn lock(&self) -> AppResult<StorageGuard<'_>> {
+        let local = self
+            .gate
             .lock()
-            .map_err(|_| AppError::Task("本地数据存储锁已损坏，请重新启动应用。".to_string()))
+            .map_err(|_| AppError::Task("本地数据存储锁已损坏，请重新启动应用。".to_string()))?;
+        let process = ProcessFileLock::acquire(
+            &self.paths.root.join("storage.lock"),
+            Duration::from_secs(5),
+        )?;
+        Ok(StorageGuard {
+            _process: process,
+            _local: local,
+        })
     }
 }
 
@@ -207,6 +237,49 @@ mod tests {
     use chrono::Utc;
     use std::{collections::BTreeMap, fs};
     use uuid::Uuid;
+
+    #[test]
+    fn separate_storage_instances_serialize_writes_but_allow_startup_during_operations() {
+        let dir = crate::test_support::TestDir::new("storage");
+        let paths = StoragePaths {
+            settings: dir.0.join("settings.json"),
+            moves: dir.0.join("moves.json"),
+            links: dir.0.join("links.json"),
+            root: dir.0.clone(),
+        };
+        let first = Storage::new(paths.clone()).unwrap();
+        let operation = first.try_operation_lock().unwrap();
+        let second = Storage::new(paths).unwrap();
+        assert!(matches!(
+            second.try_operation_lock(),
+            Err(crate::error::AppError::Conflict(_))
+        ));
+        assert!(second.load_settings().is_ok());
+        let write_records = |storage: Storage| {
+            for _ in 0..16 {
+                storage
+                    .add_move(MoveRecord {
+                        id: Uuid::new_v4(),
+                        source: "source".into(),
+                        destination: "target".into(),
+                        backup_path: None,
+                        created_at_utc: Utc::now(),
+                        destination_file_id: None,
+                        destination_volume_serial: None,
+                        final_sync_attempts: None,
+                        stage: "Preparing".into(),
+                    })
+                    .unwrap();
+            }
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| write_records(first.clone()));
+            scope.spawn(|| write_records(second.clone()));
+        });
+        assert_eq!(first.load_moves().unwrap().len(), 32);
+        drop(operation);
+        drop(second.try_operation_lock().unwrap());
+    }
 
     #[test]
     fn storage_round_trips_legacy_shapes_atomically() {

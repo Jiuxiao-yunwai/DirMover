@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "dirmover"
-version = "2.2.1"
+version = "2.2.2-dev.5"
 dependencies = [
  "chrono",
  "junction",

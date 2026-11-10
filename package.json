@@ -1,7 +1,7 @@
 {
   "name": "dirmover",
   "private": true,
-  "version": "2.2.1",
+  "version": "2.2.2-dev.5",
   "type": "module",
   "scripts": {
     "dev": "vite",

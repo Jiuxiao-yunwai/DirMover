@@ -1,12 +1,13 @@
 use crate::{
     error::{AppError, AppResult},
     models::ScanSnapshot,
+    services::scan_results::CachedScan,
     storage::Storage,
-    tasks::TaskRegistry,
+    tasks::{MigrationQueue, TaskRegistry},
 };
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 use uuid::Uuid;
 
@@ -21,64 +22,42 @@ pub struct AppState {
 }
 
 #[derive(Default)]
-pub struct MigrationQueue {
-    inner: Mutex<MigrationQueueState>,
-    ready: Condvar,
-}
-
-#[derive(Default)]
-struct MigrationQueueState {
-    next_ticket: u64,
-    serving_ticket: u64,
-}
-
-pub struct MigrationTurn {
-    queue: Arc<MigrationQueue>,
-}
-
-impl MigrationQueue {
-    pub fn reserve(&self) -> AppResult<(u64, u64)> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| AppError::Task("迁移队列状态已损坏，请重新启动应用。".to_string()))?;
-        let ticket = inner.next_ticket;
-        let ahead = ticket.saturating_sub(inner.serving_ticket);
-        inner.next_ticket = inner.next_ticket.saturating_add(1);
-        Ok((ticket, ahead))
-    }
-
-    pub fn wait_turn(self: &Arc<Self>, ticket: u64) -> AppResult<MigrationTurn> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| AppError::Task("迁移队列状态已损坏，请重新启动应用。".to_string()))?;
-        while inner.serving_ticket != ticket {
-            inner = self
-                .ready
-                .wait(inner)
-                .map_err(|_| AppError::Task("迁移队列状态已损坏，请重新启动应用。".to_string()))?;
-        }
-        drop(inner);
-        Ok(MigrationTurn {
-            queue: Arc::clone(self),
-        })
-    }
-}
-
-impl Drop for MigrationTurn {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.queue.inner.lock() {
-            inner.serving_ticket = inner.serving_ticket.saturating_add(1);
-            self.queue.ready.notify_all();
-        }
-    }
-}
-
-#[derive(Default)]
 struct ScanCache {
-    results: HashMap<Uuid, ScanSnapshot>,
+    generation: u64,
+    results: HashMap<Uuid, Arc<CachedScan>>,
     order: VecDeque<Uuid>,
+}
+
+impl ScanCache {
+    fn check_generation(&self, generation: u64) -> AppResult<()> {
+        if self.generation != generation {
+            return Err(AppError::Conflict(
+                "扫描期间目录数据发生变化，请重新扫描。".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self, snapshot: Arc<CachedScan>, generation: u64) -> AppResult<Uuid> {
+        self.check_generation(generation)?;
+        let id = snapshot.snapshot.id;
+        if !self.results.contains_key(&id) {
+            while self.order.len() >= MAX_SCAN_RESULTS {
+                if let Some(expired) = self.order.pop_front() {
+                    self.results.remove(&expired);
+                }
+            }
+            self.order.push_back(id);
+        }
+        self.results.insert(id, snapshot);
+        Ok(id)
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.results.clear();
+        self.order.clear();
+    }
 }
 
 impl AppState {
@@ -104,33 +83,34 @@ impl AppState {
         Arc::clone(&self.migration_queue)
     }
 
-    pub fn insert_scan(&self, snapshot: ScanSnapshot) -> AppResult<Uuid> {
-        let id = snapshot.id;
-        let mut cache = self.scan_cache()?;
-        if !cache.results.contains_key(&id) {
-            while cache.order.len() >= MAX_SCAN_RESULTS {
-                if let Some(expired) = cache.order.pop_front() {
-                    cache.results.remove(&expired);
-                }
-            }
-            cache.order.push_back(id);
-        }
-        cache.results.insert(id, snapshot);
-        Ok(id)
+    pub fn scan_generation(&self) -> AppResult<u64> {
+        Ok(self.scan_cache()?.generation)
     }
 
-    pub fn find_scan_by_root(&self, root: &str) -> AppResult<Option<ScanSnapshot>> {
+    pub fn publish_scan(&self, snapshot: ScanSnapshot, generation: u64) -> AppResult<Uuid> {
+        let snapshot = Arc::new(CachedScan::new(snapshot));
+        let mut cache = self.scan_cache()?;
+        cache.check_generation(generation)?;
+        // Serialize publication with invalidation, including persisted links.
+        self.storage.replace_links_for_root(
+            std::path::Path::new(&snapshot.snapshot.root),
+            &snapshot.snapshot.links,
+        )?;
+        cache.insert(snapshot, generation)
+    }
+
+    pub fn find_scan_by_root(&self, root: &str) -> AppResult<Option<Arc<CachedScan>>> {
         let cache = self.scan_cache()?;
         Ok(cache
             .order
             .iter()
             .rev()
             .filter_map(|id| cache.results.get(id))
-            .find(|snapshot| snapshot.root.eq_ignore_ascii_case(root))
+            .find(|snapshot| snapshot.snapshot.root.eq_ignore_ascii_case(root))
             .cloned())
     }
 
-    pub fn scan(&self, id: Uuid) -> AppResult<ScanSnapshot> {
+    pub fn scan(&self, id: Uuid) -> AppResult<Arc<CachedScan>> {
         self.scan_cache()?
             .results
             .get(&id)
@@ -140,8 +120,7 @@ impl AppState {
 
     pub fn clear_scans(&self) -> AppResult<()> {
         let mut cache = self.scan_cache()?;
-        cache.results.clear();
-        cache.order.clear();
+        cache.invalidate();
         Ok(())
     }
 
@@ -154,30 +133,27 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::MigrationQueue;
-    use std::sync::{Arc, Mutex};
-
+    use super::*;
     #[test]
-    fn migration_queue_serves_reserved_tickets_in_fifo_order() {
-        let queue = Arc::new(MigrationQueue::default());
-        let reservations = (0..3)
-            .map(|_| queue.reserve().expect("ticket should reserve"))
-            .collect::<Vec<_>>();
-        assert_eq!(reservations, vec![(0, 0), (1, 1), (2, 2)]);
-
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let mut workers = Vec::new();
-        for ticket in [2_u64, 1, 0] {
-            let queue = Arc::clone(&queue);
-            let order = Arc::clone(&order);
-            workers.push(std::thread::spawn(move || {
-                let _turn = queue.wait_turn(ticket).expect("turn should arrive");
-                order.lock().expect("order should lock").push(ticket);
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("worker should finish");
-        }
-        assert_eq!(*order.lock().expect("order should lock"), vec![0, 1, 2]);
+    fn a_scan_started_before_invalidation_cannot_repopulate_the_cache() {
+        let mut cache = ScanCache::default();
+        let generation = cache.generation;
+        let snapshot = Arc::new(CachedScan::new(ScanSnapshot {
+            id: Uuid::new_v4(),
+            root: "C:\\data".into(),
+            folders: Vec::new(),
+            links: Vec::new(),
+            root_bytes: 0,
+            root_allocated_bytes: 0,
+            root_files: 0,
+            engine: "test".into(),
+            created_at_utc: chrono::Utc::now(),
+        }));
+        cache.insert(Arc::clone(&snapshot), generation).unwrap();
+        cache.invalidate();
+        assert!(cache.insert(Arc::clone(&snapshot), generation).is_err());
+        assert!(cache.results.is_empty());
+        cache.insert(snapshot, cache.generation).unwrap();
+        assert_eq!(cache.results.len(), 1);
     }
 }

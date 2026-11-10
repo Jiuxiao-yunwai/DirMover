@@ -131,11 +131,14 @@ export type TaskDescriptor = {
   id: string;
   kind: TaskKind;
   state: TaskState;
-  percentage: number;
+  canCancel: boolean;
+  cancelRequested: boolean;
+  percentage: number | null;
   phase: string;
   message: string;
   resultId: string | null;
   startedAtUtc: string;
+  runningAtUtc: string | null;
   finishedAtUtc: string | null;
 };
 

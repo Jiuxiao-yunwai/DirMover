@@ -7,7 +7,7 @@
 //! 3. Recovery always derives the backup path from the migration UUID.
 //! 4. /MIR is gated on destination identity verification (marker file + NTFS ids).
 //! 5. Cancellation after rename is deferred until the source path is usable again.
-//! 6. Only one migration runs at a time (process-level lock in AppState).
+//! 6. A FIFO task queue and data-directory file lock serialize operations across instances.
 //!
 //! ## Migration flow (4 scans -> 1 scan)
 //!
@@ -35,6 +35,7 @@ use crate::{
     },
     platform,
     services::{
+        diagnostics::OperationTrace,
         robocopy::{self, MAX_FINAL_SYNC_ATTEMPTS},
         scanner, storage_planner,
     },
@@ -72,6 +73,38 @@ pub fn move_directory(
     cancellation: &CancellationFlag,
     progress: &(dyn Fn(ScanProgress) + Send + Sync),
 ) -> AppResult<MigrationOutcome> {
+    let trace = OperationTrace::new(
+        &storage.paths().root,
+        "move_directory",
+        serde_json::json!({ "source": source.to_string_lossy(), "destination": destination.to_string_lossy() }),
+    );
+    let result = (|| {
+        let _operation = storage.try_operation_lock()?;
+        let tracked_progress = |update: ScanProgress| {
+            trace.phase(&update.phase);
+            progress(update);
+        };
+        move_directory_inner(
+            storage,
+            source,
+            destination,
+            cancellation,
+            &tracked_progress,
+            &trace,
+        )
+    })();
+    trace.finish(&result);
+    result
+}
+
+fn move_directory_inner(
+    storage: &Storage,
+    source: &Path,
+    destination: &Path,
+    cancellation: &CancellationFlag,
+    progress: &(dyn Fn(ScanProgress) + Send + Sync),
+    trace: &OperationTrace,
+) -> AppResult<MigrationOutcome> {
     let total_start = Instant::now();
     let source = absolute_lexical(source)?;
     let destination = absolute_lexical(destination)?;
@@ -80,8 +113,8 @@ pub fn move_directory(
     let phase_start = Instant::now();
     validate_move(storage, &source, &destination)?;
 
-    progress_update(progress, 2, "measure", "正在扫描源目录（单次全量）…");
-    let source_stats = scanner::measure(&source, cancellation);
+    progress_update(progress, "measure", "正在检查源目录…");
+    let source_stats = scanner::measure_for_migration(&source, cancellation);
     cancellation.check()?;
     if source_stats.errors > 0 {
         return Err(AppError::PermissionDenied(format!(
@@ -129,8 +162,9 @@ pub fn move_directory(
         record.destination_volume_serial = Some(volume_serial);
         storage.update_move(&record)?;
 
-        progress_update(progress, 8, "copy", "正在复制到新位置（/MT:8）…");
-        let robocopy_result = robocopy::run_initial_copy(&source, &destination, cancellation)?;
+        progress_update(progress, "copy", "正在复制文件到新位置…");
+        let robocopy_result =
+            robocopy::run_initial_copy(&source, &destination, cancellation, trace)?;
         cancellation.check()?;
         if robocopy_result.has_failures() || robocopy_result.has_fatal_error() {
             return Err(AppError::Task(format!(
@@ -142,12 +176,13 @@ pub fn move_directory(
 
         // Phase 3: Cutover -- critical section
         // After this point source is renamed, cancellation is deferred.
+        cancellation.begin_commit()?;
         let phase_start = Instant::now();
         record.backup_path = Some(backup.to_string_lossy().into_owned());
         record.stage = CUTOVER_PLANNED.to_string();
         storage.update_move(&record)?;
 
-        progress_update(progress, 48, "cutover", "正在切换原目录（原子重命名）…");
+        progress_update(progress, "cutover", "正在切换原目录…");
         fs::rename(&source, &backup)?;
         record.stage = SOURCE_RENAMED.to_string();
         storage.update_move(&record)?;
@@ -156,21 +191,16 @@ pub fn move_directory(
         // Phase 4: Final Sync (cancellation deferred)
         let phase_start = Instant::now();
         let mut sync_attempts: u32 = 0;
-        progress_update(progress, 52, "sync", "正在最终镜像同步（/MIR）…");
+        progress_update(progress, "sync", "正在同步最后的变化…");
         verify_destination_identity(&destination, record.id, file_id, volume_serial)?;
         loop {
             sync_attempts += 1;
             verify_destination_file_identity(&destination, file_id, volume_serial)?;
             if sync_attempts > 1 {
-                progress_update(
-                    progress,
-                    55,
-                    "sync",
-                    &format!("最终同步第 {sync_attempts} 轮…"),
-                );
+                progress_update(progress, "sync", &format!("最终同步第 {sync_attempts} 轮…"));
             }
             let mirror_result =
-                robocopy::run_mirror_sync(&backup, &destination, &never_cancelled())?;
+                robocopy::run_mirror_sync(&backup, &destination, &never_cancelled(), trace)?;
             if mirror_result.has_failures() || mirror_result.has_fatal_error() {
                 return Err(AppError::Task(format!(
                     "最终镜像同步失败（Robocopy 退出码 {}）。",
@@ -178,7 +208,7 @@ pub fn move_directory(
                 )));
             }
             let dry_result =
-                robocopy::run_dry_run_verify(&backup, &destination, &never_cancelled())?;
+                robocopy::run_dry_run_verify(&backup, &destination, &never_cancelled(), trace)?;
             if dry_result.is_converged() {
                 break;
             }
@@ -199,7 +229,7 @@ pub fn move_directory(
         let phase_start = Instant::now();
         record.stage = JUNCTION_PLANNED.to_string();
         storage.update_move(&record)?;
-        progress_update(progress, 78, "junction", "正在创建并验证目录联接…");
+        progress_update(progress, "junction", "正在创建并验证目录联接…");
         platform::create_junction(&source, &destination)?;
         if !points_to(&source, &destination) {
             let _ = platform::remove_junction(&source);
@@ -220,7 +250,7 @@ pub fn move_directory(
 
         // Phase 6: Cleanup
         let phase_start = Instant::now();
-        progress_update(progress, 92, "cleanup", "正在清理旧数据备份…");
+        progress_update(progress, "cleanup", "正在清理旧数据备份…");
         match fs::remove_dir_all(&backup) {
             Ok(()) => {
                 record.backup_path = None;
@@ -234,21 +264,12 @@ pub fn move_directory(
         let cleanup_ms = phase_start.elapsed().as_millis();
         let total_ms = total_start.elapsed().as_millis();
 
-        eprintln!(
-            "DirMover Migration {}: files={} size={} mt={} sync_rounds={} pscan={}ms copy={}ms cut={}ms fsync={}ms junc={}ms clean={}ms total={}ms",
-            record.id,
-            source_stats.files,
-            source_stats.bytes,
-            robocopy::ROBOCOPY_DEFAULT_THREADS,
-            sync_attempts,
-            preflight_scan_ms,
-            initial_copy_ms,
-            cutover_ms,
-            final_sync_ms,
-            junction_ms,
-            cleanup_ms,
-            total_ms
-        );
+        trace.record("migration_metrics", serde_json::json!({
+            "recordId": record.id, "files": source_stats.files, "bytes": source_stats.bytes,
+            "threads": robocopy::ROBOCOPY_DEFAULT_THREADS, "syncRounds": sync_attempts,
+            "preflightMs": preflight_scan_ms, "copyMs": initial_copy_ms, "cutoverMs": cutover_ms,
+            "syncMs": final_sync_ms, "junctionMs": junction_ms, "cleanupMs": cleanup_ms, "totalMs": total_ms,
+        }));
 
         let summary = if record.stage == CLEANUP_PENDING {
             format!(
@@ -264,7 +285,7 @@ pub fn move_directory(
                 format_bytes(source_stats.bytes)
             )
         };
-        progress_update(progress, 100, "complete", "迁移完成");
+        progress_update(progress, "complete", "迁移完成");
         Ok(MigrationOutcome {
             summary,
             record_id: Some(record.id),
@@ -286,6 +307,30 @@ pub fn restore_directory(
     record_id: Uuid,
     cancellation: &CancellationFlag,
     progress: &(dyn Fn(ScanProgress) + Send + Sync),
+) -> AppResult<MigrationOutcome> {
+    let trace = OperationTrace::new(
+        &storage.paths().root,
+        "restore_directory",
+        serde_json::json!({ "recordId": record_id }),
+    );
+    let result = (|| {
+        let _operation = storage.try_operation_lock()?;
+        let tracked_progress = |update: ScanProgress| {
+            trace.phase(&update.phase);
+            progress(update);
+        };
+        restore_directory_inner(storage, record_id, cancellation, &tracked_progress, &trace)
+    })();
+    trace.finish(&result);
+    result
+}
+
+fn restore_directory_inner(
+    storage: &Storage,
+    record_id: Uuid,
+    cancellation: &CancellationFlag,
+    progress: &(dyn Fn(ScanProgress) + Send + Sync),
+    trace: &OperationTrace,
 ) -> AppResult<MigrationOutcome> {
     let mut record = storage
         .load_moves()?
@@ -321,8 +366,8 @@ pub fn restore_directory(
     storage.update_move(&record)?;
 
     let result = (|| -> AppResult<MigrationOutcome> {
-        progress_update(progress, 4, "measure", "正在检查新位置的数据…");
-        let target_stats = scanner::measure(&destination, cancellation);
+        progress_update(progress, "measure", "正在检查新位置的数据…");
+        let target_stats = scanner::measure_for_migration(&destination, cancellation);
         cancellation.check()?;
         if target_stats.errors > 0 {
             return Err(AppError::PermissionDenied(
@@ -341,8 +386,8 @@ pub fn restore_directory(
             ));
         }
 
-        progress_update(progress, 10, "copy", "正在复制回原磁盘…");
-        let copy_result = robocopy::run_initial_copy(&destination, &staging, cancellation)?;
+        progress_update(progress, "copy", "正在复制回原磁盘…");
+        let copy_result = robocopy::run_initial_copy(&destination, &staging, cancellation, trace)?;
         cancellation.check()?;
         if copy_result.has_failures() || copy_result.has_fatal_error() {
             return Err(AppError::Task(format!(
@@ -353,24 +398,29 @@ pub fn restore_directory(
 
         // Commit boundary: stop new writes through the junction, then perform an
         // uncancellable final mirror before exposing the restored directory.
-        progress_update(progress, 68, "switch", "正在停止新位置写入…");
+        cancellation.begin_commit()?;
+        progress_update(progress, "switch", "正在停止新位置写入…");
         verify_recorded_destination_identity(&destination, &record, true)?;
         platform::remove_junction(&source)?;
 
         let cutover_result = (|| -> AppResult<()> {
-            progress_update(progress, 72, "sync", "正在最终同步还原副本…");
+            progress_update(progress, "sync", "正在最终同步还原副本…");
             for attempt in 1..=MAX_FINAL_SYNC_ATTEMPTS {
                 verify_recorded_destination_identity(&destination, &record, true)?;
                 let mirror_result =
-                    robocopy::run_mirror_sync(&destination, &staging, &never_cancelled())?;
+                    robocopy::run_mirror_sync(&destination, &staging, &never_cancelled(), trace)?;
                 if mirror_result.has_failures() || mirror_result.has_fatal_error() {
                     return Err(AppError::Task(format!(
                         "还原最终同步失败（Robocopy 退出码 {}）。",
                         mirror_result.exit_code
                     )));
                 }
-                let dry_result =
-                    robocopy::run_dry_run_verify(&destination, &staging, &never_cancelled())?;
+                let dry_result = robocopy::run_dry_run_verify(
+                    &destination,
+                    &staging,
+                    &never_cancelled(),
+                    trace,
+                )?;
                 if dry_result.is_converged() {
                     let copied_marker = staging.join(MIGRATION_MARKER_FILE_NAME);
                     if copied_marker.exists() {
@@ -382,7 +432,6 @@ pub fn restore_directory(
                 if attempt < MAX_FINAL_SYNC_ATTEMPTS {
                     progress_update(
                         progress,
-                        74,
                         "sync",
                         &format!("还原最终同步第 {} 轮…", attempt + 1),
                     );
@@ -404,7 +453,7 @@ pub fn restore_directory(
             return Err(error);
         }
 
-        progress_update(progress, 90, "cleanup", "正在清理新位置副本…");
+        progress_update(progress, "cleanup", "正在清理新位置副本…");
         record.stage = RESTORE_CLEANUP_PENDING.to_string();
         storage.update_move(&record)?;
         verify_recorded_destination_identity(&destination, &record, true)?;
@@ -428,7 +477,7 @@ pub fn restore_directory(
 
     match result {
         Ok(outcome) => {
-            progress_update(progress, 100, "complete", "还原完成");
+            progress_update(progress, "complete", "还原完成");
             Ok(outcome)
         }
         Err(error) => {
@@ -447,6 +496,21 @@ pub fn restore_directory(
 /// Attempt to recover an interrupted migration by inspecting both the persisted
 /// stage and actual filesystem state. Never deletes data that cannot be identified.
 pub fn recover_interrupted(storage: &Storage, record_id: Uuid) -> AppResult<String> {
+    let trace = OperationTrace::new(
+        &storage.paths().root,
+        "recover",
+        serde_json::json!({ "recordId": record_id }),
+    );
+    let result = (|| {
+        let _operation = storage.try_operation_lock()?;
+        trace.phase("recover");
+        recover_interrupted_inner(storage, record_id)
+    })();
+    trace.finish(&result);
+    result
+}
+
+fn recover_interrupted_inner(storage: &Storage, record_id: Uuid) -> AppResult<String> {
     let mut record = storage
         .load_moves()?
         .into_iter()
@@ -1065,14 +1129,9 @@ fn absolute_lexical(path: &Path) -> AppResult<PathBuf> {
     }
 }
 
-fn progress_update(
-    progress: &(dyn Fn(ScanProgress) + Send + Sync),
-    percentage: u8,
-    phase: &str,
-    message: &str,
-) {
+fn progress_update(progress: &(dyn Fn(ScanProgress) + Send + Sync), phase: &str, message: &str) {
     progress(ScanProgress {
-        percentage,
+        percentage: (phase == "complete").then_some(100),
         phase: phase.to_string(),
         message: message.to_string(),
     });

@@ -5,6 +5,7 @@ import BaseProgress from "@/components/base/BaseProgress.vue";
 import AppLayout, { type ViewKey } from "@/layouts/AppLayout.vue";
 import { useTheme } from "@/composables/useTheme";
 import { api } from "@/services/api";
+import { createRefreshScheduler } from "@/services/refreshScheduler";
 import { normalizeAppError } from "@/services/tauri";
 import type { BootstrapData } from "@/types/domain";
 import LinkInspectorView from "@/views/LinkInspectorView.vue";
@@ -20,6 +21,7 @@ const bootstrapError = ref("");
 const loading = ref(true);
 const activeView = ref<ViewKey>("space");
 const status = ref("正在启动…");
+const dataRevision = ref(0);
 const busyByView = ref({
   space: false,
   moves: false,
@@ -30,12 +32,18 @@ const busy = computed(() => Object.values(busyByView.value).some(Boolean));
 const toast = ref<{ message: string; tone: ToastTone } | null>(null);
 const { preference: theme } = useTheme();
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
+const bootstrapRefresh = createRefreshScheduler({
+  load: () => api.bootstrap(),
+  apply: (value) => { bootstrap.value = value; },
+  onError: (error) => notify(normalizeAppError(error).message, "error"),
+});
 
 onMounted(loadBootstrap);
 onMounted(() => {
   document.addEventListener("contextmenu", suppressNativeContextMenu);
 });
 onBeforeUnmount(() => {
+  bootstrapRefresh.dispose();
   if (toastTimer) clearTimeout(toastTimer);
   document.removeEventListener("contextmenu", suppressNativeContextMenu);
 });
@@ -54,12 +62,13 @@ async function loadBootstrap(): Promise<void> {
   }
 }
 
-async function refreshBootstrap(): Promise<void> {
-  try {
-    bootstrap.value = await api.bootstrap();
-  } catch (error: unknown) {
-    notify(normalizeAppError(error).message, "error");
-  }
+function refreshBootstrap(): void {
+  bootstrapRefresh.request();
+}
+
+function filesystemChanged(): void {
+  dataRevision.value += 1;
+  refreshBootstrap();
 }
 
 function notify(message: string, tone: ToastTone = "info"): void {
@@ -113,9 +122,10 @@ function suppressNativeContextMenu(event: MouseEvent): void {
     <div v-show="activeView === 'space'" class="view-host">
       <SpaceAnalysisView
         :bootstrap="bootstrap"
+        :data-revision="dataRevision"
         @status="status = $event"
         @busy="setViewBusy('space', $event)"
-        @refresh-data="refreshBootstrap"
+        @refresh-data="filesystemChanged"
         @notify="notify"
       />
     </div>
@@ -124,7 +134,7 @@ function suppressNativeContextMenu(event: MouseEvent): void {
         :bootstrap="bootstrap"
         @status="status = $event"
         @busy="setViewBusy('moves', $event)"
-        @refresh-data="refreshBootstrap"
+        @refresh-data="filesystemChanged"
         @notify="notify"
       />
     </div>

@@ -106,11 +106,15 @@ pub fn scan_presets() -> Vec<ScanPreset> {
 
 pub fn automatic_managed_root() -> Option<PathBuf> {
     let drives = platform::fixed_ntfs_drives();
+    automatic_managed_root_for(&drives)
+}
+
+pub fn automatic_managed_root_for(drives: &[DriveInfo]) -> Option<PathBuf> {
     let system_root = system_drive_root();
     let system_disk = platform::physical_disk_location(Path::new(&system_root))
         .ok()
         .map(|(disk, _)| disk);
-    select_automatic_drive(&drives, system_disk, |root| {
+    select_automatic_drive(drives, system_disk, |root| {
         platform::physical_disk_location(Path::new(root)).ok()
     })
     .map(|drive| Path::new(&drive.root).join(MANAGED_FOLDER_NAME))
@@ -164,6 +168,14 @@ pub fn category_for_source(source: &Path) -> ManagedCategory {
 }
 
 pub fn category_root(settings: &AppSettings, category: &ManagedCategory) -> Option<PathBuf> {
+    category_root_with(settings, category, automatic_managed_root)
+}
+
+fn category_root_with(
+    settings: &AppSettings,
+    category: &ManagedCategory,
+    automatic: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
     if let Some(overridden) = settings.category_roots.get(category.key)
         && !overridden.trim().is_empty()
     {
@@ -174,18 +186,23 @@ pub fn category_root(settings: &AppSettings, category: &ManagedCategory) -> Opti
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
-        .or_else(automatic_managed_root)?;
+        .or_else(automatic)?;
     Some(base.join(category.default_relative_root))
 }
 
-pub fn managed_locations(settings: &AppSettings) -> Vec<ManagedCategoryRow> {
+pub fn managed_locations(
+    settings: &AppSettings,
+    automatic_root: Option<&Path>,
+) -> Vec<ManagedCategoryRow> {
     categories()
         .into_iter()
         .map(|category| ManagedCategoryRow {
             key: category.key.to_string(),
             label: category.label.to_string(),
-            path: category_root(settings, &category)
-                .map(|path| path.to_string_lossy().into_owned()),
+            path: category_root_with(settings, &category, || {
+                automatic_root.map(Path::to_path_buf)
+            })
+            .map(|path| path.to_string_lossy().into_owned()),
             overridden: settings.category_roots.contains_key(category.key),
         })
         .collect()
@@ -334,6 +351,42 @@ mod tests {
     };
     use crate::models::DriveInfo;
     use std::path::Path;
+
+    #[test]
+    fn managed_locations_reuse_the_supplied_root_and_preserve_overrides() {
+        let mut settings = crate::models::AppSettings::default();
+        let automatic = Path::new(r"D:\DirMoverData");
+        let rows = super::managed_locations(&settings, Some(automatic));
+        assert_eq!(rows.len(), categories().len());
+        assert!(rows.iter().all(|row| {
+            row.path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).starts_with(automatic))
+        }));
+        settings.managed_root = Some(r"E:\Managed".into());
+        settings
+            .category_roots
+            .insert("Other".into(), r"F:\Custom".into());
+        let rows = super::managed_locations(&settings, Some(automatic));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key == "Other")
+                .unwrap()
+                .path
+                .as_deref(),
+            Some(r"F:\Custom")
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.key != "Other")
+                .all(|row| Path::new(row.path.as_ref().unwrap()).starts_with(r"E:\Managed"))
+        );
+        assert!(
+            super::managed_locations(&crate::models::AppSettings::default(), None)
+                .iter()
+                .all(|row| row.path.is_none())
+        );
+    }
 
     #[test]
     fn detects_windows_path_boundaries_case_insensitively() {

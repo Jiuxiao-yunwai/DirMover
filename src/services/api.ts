@@ -14,6 +14,7 @@ import type {
   TaskEvent,
 } from "@/types/domain";
 import { invokeCommand } from "./tauri";
+import { mergeTaskState } from "@/utils/taskState";
 
 export const api = {
   bootstrap(): Promise<BootstrapData> {
@@ -71,12 +72,11 @@ export const api = {
     requests: MigrationRequest[],
     onEvent: (event: TaskEvent) => void,
   ): Promise<TaskDescriptor[]> {
-    const channel = new Channel<TaskEvent>();
-    channel.onmessage = onEvent;
+    const { channel, latest } = taskChannel(onEvent);
     return invokeCommand<TaskDescriptor[]>("start_migrations", {
       requests,
       onEvent: channel,
-    });
+    }).then((tasks) => tasks.map((task) => latest.get(task.id) ?? task));
   },
 
   startRestore(
@@ -102,6 +102,10 @@ export const api = {
     return invokeCommand("open_managed_root");
   },
 
+  openDiagnostics(): Promise<void> {
+    return invokeCommand("open_diagnostics");
+  },
+
   requestElevation(scanRoot: string | null): Promise<boolean> {
     return invokeCommand("request_elevation", { scanRoot });
   },
@@ -122,7 +126,20 @@ async function startTask(
   args: Record<string, unknown>,
   onEvent: (event: TaskEvent) => void,
 ): Promise<TaskDescriptor> {
+  const { channel, latest } = taskChannel(onEvent);
+  const response = await invokeCommand<TaskDescriptor>(command, { ...args, onEvent: channel });
+  return latest.get(response.id) ?? response;
+}
+
+function taskChannel(onEvent: (event: TaskEvent) => void) {
+  const latest = new Map<string, TaskDescriptor>();
   const channel = new Channel<TaskEvent>();
-  channel.onmessage = onEvent;
-  return invokeCommand<TaskDescriptor>(command, { ...args, onEvent: channel });
+  channel.onmessage = (event) => {
+    const current = latest.get(event.task.id);
+    const task = mergeTaskState(current, event.task);
+    if (task === current) return;
+    latest.set(task.id, task);
+    onEvent({ ...event, task });
+  };
+  return { channel, latest };
 }

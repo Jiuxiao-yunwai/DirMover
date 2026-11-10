@@ -1,5 +1,7 @@
 //! Directory preview, filesystem fallback scanning, and NTFS MFT scanning.
 
+mod enumeration;
+
 use crate::{
     error::{AppError, AppResult},
     models::{FolderRow, LinkRow, ScanProgress, ScanSnapshot},
@@ -10,18 +12,27 @@ use chrono::Utc;
 use std::{
     fs,
     os::windows::fs::MetadataExt,
-    path::{Path, PathBuf},
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    path::{Component, Path},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+const SMALL_TREE_MAX_ENTRIES: usize = 1024;
+const SMALL_TREE_PROBE_TIME: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FolderStats {
     pub bytes: u64,
     pub allocated_bytes: u64,
+    pub files: u64,
+    pub links: u64,
+    pub errors: u64,
+}
+
+/// Migration preflight needs logical size and safety checks, not allocated size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MigrationStats {
+    pub bytes: u64,
     pub files: u64,
     pub links: u64,
     pub errors: u64,
@@ -39,16 +50,16 @@ pub fn list_child_folders(
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        let path = entry.path();
-        let is_link = platform::is_reparse_point(&path).unwrap_or(false);
-        let is_directory = entry
-            .file_type()
-            .map(|file_type| file_type.is_dir())
-            .unwrap_or(false)
-            || is_link;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let is_link = platform::is_reparse_point_from_attributes(metadata.file_attributes());
+        let is_directory = metadata.is_dir() || is_link;
         if !is_directory {
             continue;
         }
+        let path = entry.path();
         let target = if is_link {
             platform::link_target(&path)
                 .ok()
@@ -75,7 +86,7 @@ pub fn list_child_folders(
             measured: false,
         });
     }
-    rows.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    rows.sort_by_cached_key(|row| row.name.to_lowercase());
     Ok(rows)
 }
 
@@ -84,7 +95,22 @@ pub fn scan_children(
     cancellation: &CancellationFlag,
     progress: &(dyn Fn(ScanProgress) + Send + Sync),
 ) -> AppResult<ScanSnapshot> {
+    scan_children_with_probe(root, cancellation, progress, SMALL_TREE_PROBE_TIME)
+}
+
+fn scan_children_with_probe(
+    root: &Path,
+    cancellation: &CancellationFlag,
+    progress: &(dyn Fn(ScanProgress) + Send + Sync),
+    probe_time: Duration,
+) -> AppResult<ScanSnapshot> {
     validate_directory(root)?;
+    cancellation.check()?;
+    if has_small_tree(root, cancellation, SMALL_TREE_MAX_ENTRIES, probe_time)? {
+        let mut snapshot = scan_children_by_enumeration(root, cancellation, progress)?;
+        snapshot.engine = "快速遍历".to_string();
+        return Ok(snapshot);
+    }
     #[cfg(windows)]
     {
         match crate::platform::scan_mft_children(root, cancellation, progress) {
@@ -141,7 +167,7 @@ pub fn scan_children(
             Err(AppError::Cancelled) => return Err(AppError::Cancelled),
             Err(_) => {
                 progress(ScanProgress {
-                    percentage: 2,
+                    percentage: None,
                     phase: "fallback".to_string(),
                     message: "MFT 扫描不可用，正在切换到兼容扫描…".to_string(),
                 });
@@ -156,82 +182,84 @@ pub fn scan_children_by_enumeration(
     cancellation: &CancellationFlag,
     progress: &(dyn Fn(ScanProgress) + Send + Sync),
 ) -> AppResult<ScanSnapshot> {
-    let directories = list_child_paths(root)?;
-    let root_stats = measure_direct_files(root, cancellation);
-    let total = directories.len();
-    let next = AtomicUsize::new(0);
-    let completed = AtomicUsize::new(0);
-    let rows = Mutex::new(Vec::with_capacity(total));
-    let links = Mutex::new(Vec::new());
-    let workers = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(2)
-        .clamp(2, 8)
-        .min(total.max(1));
-
-    progress(ScanProgress {
-        percentage: 5,
-        phase: "fallback".to_string(),
-        message: "正在使用兼容扫描…".to_string(),
-    });
-
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    if cancellation.is_cancelled() {
-                        break;
-                    }
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(path) = directories.get(index) else {
-                        break;
-                    };
-                    let row = scan_top_folder(path, root, cancellation, &links);
-                    if let Ok(mut target) = rows.lock() {
-                        target.push(row);
-                    }
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let percentage = if total == 0 {
-                        100
-                    } else {
-                        5 + (done * 94 / total).min(94)
-                    };
-                    progress(ScanProgress {
-                        percentage: u8::try_from(percentage).unwrap_or(99),
-                        phase: "fallback".to_string(),
-                        message: format!("正在扫描文件夹 {done}/{total}"),
-                    });
-                }
-            });
-        }
-    });
-    cancellation.check()?;
-
-    let rows = rows
-        .into_inner()
-        .map_err(|_| AppError::Task("扫描结果锁已损坏。".to_string()))?;
-    let links = links
-        .into_inner()
-        .map_err(|_| AppError::Task("链接结果锁已损坏。".to_string()))?;
-    progress(ScanProgress {
-        percentage: 100,
-        phase: "complete".to_string(),
-        message: "扫描完成".to_string(),
-    });
-    Ok(ScanSnapshot {
-        id: Uuid::new_v4(),
-        root: root.to_string_lossy().into_owned(),
-        folders: rows,
-        links,
-        root_bytes: root_stats.bytes,
-        root_allocated_bytes: root_stats.allocated_bytes,
-        root_files: root_stats.files,
-        engine: "兼容模式".to_string(),
-        created_at_utc: Utc::now(),
-    })
+    enumeration::scan(root, cancellation, progress)
 }
 
-pub fn measure(root: &Path, cancellation: &CancellationFlag) -> FolderStats {
+/// A bounded metadata-only probe avoids reading an entire volume's MFT for a
+/// small subtree. It never queries allocated sizes or follows reparse points.
+/// Large/erroring trees retain the existing MFT-then-enumeration path.
+fn has_small_tree(
+    root: &Path,
+    cancellation: &CancellationFlag,
+    max_entries: usize,
+    time_limit: Duration,
+) -> AppResult<bool> {
+    if !root
+        .components()
+        .any(|part| matches!(part, Component::Normal(_)))
+    {
+        return Ok(false);
+    }
+    let started = Instant::now();
+    let mut seen = 0;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        cancellation.check()?;
+        if started.elapsed() >= time_limit {
+            return Ok(false);
+        }
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(false),
+        };
+        for entry in entries {
+            cancellation.check()?;
+            if seen >= max_entries || started.elapsed() >= time_limit {
+                return Ok(false);
+            }
+            seen += 1;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return Ok(false),
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => return Ok(false),
+            };
+            let attributes = metadata.file_attributes();
+            if (metadata.is_dir() || attributes & 0x10 != 0)
+                && !platform::is_reparse_point_from_attributes(attributes)
+            {
+                pending.push(entry.path());
+            }
+        }
+    }
+    cancellation.check()?;
+    Ok(started.elapsed() < time_limit)
+}
+
+/// Reuse the metadata returned by Windows directory enumeration. This avoids
+/// opening every entry again and querying allocation information that migration
+/// never consumes. Reparse points are still classified without following them;
+/// Robocopy remains responsible for reporting file-content access failures.
+pub fn measure_for_migration(root: &Path, cancellation: &CancellationFlag) -> MigrationStats {
+    let stats = measure_with(root, cancellation, |entry| {
+        let metadata = entry.metadata()?;
+        Ok(classify_entry(&metadata, || 0))
+    });
+    MigrationStats {
+        bytes: stats.bytes,
+        files: stats.files,
+        links: stats.links,
+        errors: stats.errors,
+    }
+}
+
+fn measure_with(
+    root: &Path,
+    cancellation: &CancellationFlag,
+    inspect: impl Fn(&fs::DirEntry) -> AppResult<MeasureEntry>,
+) -> FolderStats {
     let mut stats = FolderStats::default();
     let mut stack = vec![root.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -256,10 +284,9 @@ pub fn measure(root: &Path, cancellation: &CancellationFlag) -> FolderStats {
                     continue;
                 }
             };
-            let path = entry.path();
-            match measure_entry(&path) {
+            match inspect(&entry) {
                 Ok(MeasureEntry::Link) => stats.links += 1,
-                Ok(MeasureEntry::Directory) => stack.push(path),
+                Ok(MeasureEntry::Directory) => stack.push(entry.path()),
                 Ok(MeasureEntry::File {
                     bytes,
                     allocated_bytes,
@@ -277,45 +304,6 @@ pub fn measure(root: &Path, cancellation: &CancellationFlag) -> FolderStats {
     stats
 }
 
-fn measure_direct_files(root: &Path, cancellation: &CancellationFlag) -> FolderStats {
-    let mut stats = FolderStats::default();
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(_) => {
-            stats.errors = 1;
-            return stats;
-        }
-    };
-    for entry in entries {
-        if cancellation.is_cancelled() {
-            break;
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                stats.errors = stats.errors.saturating_add(1);
-                continue;
-            }
-        };
-        match measure_entry(&entry.path()) {
-            Ok(MeasureEntry::File {
-                bytes,
-                allocated_bytes,
-                is_link,
-            }) => {
-                stats.bytes = stats.bytes.saturating_add(bytes);
-                stats.allocated_bytes = stats.allocated_bytes.saturating_add(allocated_bytes);
-                stats.files = stats.files.saturating_add(1);
-                stats.links = stats.links.saturating_add(u64::from(is_link));
-            }
-            Ok(MeasureEntry::Link) => stats.links = stats.links.saturating_add(1),
-            Ok(MeasureEntry::Directory) => {}
-            Err(_) => stats.errors = stats.errors.saturating_add(1),
-        }
-    }
-    stats
-}
-
 pub fn find_links(root: &Path, cancellation: &CancellationFlag) -> AppResult<Vec<LinkRow>> {
     validate_directory(root)?;
     let mut found = Vec::new();
@@ -325,10 +313,14 @@ pub fn find_links(root: &Path, cancellation: &CancellationFlag) -> AppResult<Vec
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        let path = entry.path();
-        if platform::is_reparse_point(&path).unwrap_or(false) {
-            let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-            found.push(create_link_row(&path, is_directory, root));
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let attributes = metadata.file_attributes();
+        if platform::is_reparse_point_from_attributes(attributes) {
+            let is_directory = metadata.is_dir() || attributes & 0x10 != 0;
+            found.push(create_link_row(&entry.path(), is_directory, root));
         }
     }
     Ok(found)
@@ -360,75 +352,6 @@ pub fn create_link_row(path: &Path, is_directory: bool, scan_root: &Path) -> Lin
     }
 }
 
-fn list_child_paths(root: &Path) -> AppResult<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        let is_directory = fs::symlink_metadata(&path)
-            .map(|metadata| metadata.is_dir() || metadata.file_attributes() & 0x10 != 0)
-            .unwrap_or(false);
-        if is_directory {
-            paths.push(path);
-        }
-    }
-    Ok(paths)
-}
-
-fn scan_top_folder(
-    path: &Path,
-    scan_root: &Path,
-    cancellation: &CancellationFlag,
-    links: &Mutex<Vec<LinkRow>>,
-) -> FolderRow {
-    let name = path
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let is_link = platform::is_reparse_point(path).unwrap_or(false);
-    if is_link {
-        let link = create_link_row(path, true, scan_root);
-        if let Ok(mut target) = links.lock() {
-            target.push(link.clone());
-        }
-        return FolderRow {
-            name,
-            full_path: path.to_string_lossy().into_owned(),
-            bytes: 0,
-            allocated_bytes: 0,
-            file_count: 0,
-            link_count: 1,
-            error_count: 0,
-            is_link: true,
-            link_target: (link.target != "无法解析").then_some(link.target),
-            note: "兼容扫描：目录链接".to_string(),
-            measured: true,
-        };
-    }
-
-    let stats = measure(path, cancellation);
-    FolderRow {
-        name,
-        full_path: path.to_string_lossy().into_owned(),
-        bytes: stats.bytes,
-        allocated_bytes: stats.allocated_bytes,
-        file_count: stats.files,
-        link_count: stats.links,
-        error_count: stats.errors,
-        is_link: false,
-        link_target: None,
-        note: if stats.errors == 0 {
-            "兼容扫描".to_string()
-        } else {
-            format!("兼容扫描：{} 项无法读取", stats.errors)
-        },
-        measured: true,
-    }
-}
-
 enum MeasureEntry {
     Link,
     Directory,
@@ -439,23 +362,29 @@ enum MeasureEntry {
     },
 }
 
-fn measure_entry(path: &Path) -> AppResult<MeasureEntry> {
-    let metadata = fs::symlink_metadata(path)?;
+fn measure_cached_entry(entry: &fs::DirEntry) -> AppResult<MeasureEntry> {
+    let metadata = entry.metadata()?;
+    Ok(classify_entry(&metadata, || {
+        platform::allocated_size(&entry.path()).unwrap_or(metadata.len())
+    }))
+}
+
+fn classify_entry(metadata: &fs::Metadata, allocated_bytes: impl FnOnce() -> u64) -> MeasureEntry {
     let attributes = metadata.file_attributes();
     let is_reparse = platform::is_reparse_point_from_attributes(attributes);
     let is_directory = metadata.is_dir() || attributes & 0x10 != 0;
     if is_directory {
         if is_reparse {
-            Ok(MeasureEntry::Link)
+            MeasureEntry::Link
         } else {
-            Ok(MeasureEntry::Directory)
+            MeasureEntry::Directory
         }
     } else {
-        Ok(MeasureEntry::File {
+        MeasureEntry::File {
             bytes: metadata.len(),
-            allocated_bytes: platform::allocated_size(path).unwrap_or(metadata.len()),
+            allocated_bytes: allocated_bytes(),
             is_link: is_reparse,
-        })
+        }
     }
 }
 
@@ -471,3 +400,6 @@ fn validate_directory(root: &Path) -> AppResult<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

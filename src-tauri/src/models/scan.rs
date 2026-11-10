@@ -103,7 +103,7 @@ impl ScanSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, Deserialize, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum SortField {
     #[default]
@@ -234,10 +234,10 @@ pub struct ScanPage {
     pub total_files: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanProgress {
-    pub percentage: u8,
+    pub percentage: Option<u8>,
     pub phase: String,
     pub message: String,
 }

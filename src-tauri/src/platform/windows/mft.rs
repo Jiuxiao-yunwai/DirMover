@@ -129,7 +129,7 @@ pub fn scan_mft_children(
     progress: &(dyn Fn(ScanProgress) + Send + Sync),
 ) -> AppResult<MftScan> {
     progress(ScanProgress {
-        percentage: 1,
+        percentage: None,
         phase: "mft-open".to_string(),
         message: "正在打开 NTFS 卷…".to_string(),
     });
@@ -200,7 +200,7 @@ pub fn scan_mft_children(
         },
         |value| {
             progress(ScanProgress {
-                percentage: 5 + (value * 80.0) as u8,
+                percentage: Some((value * 100.0) as u8),
                 phase: "mft-read".to_string(),
                 message: "正在单遍读取 MFT…".to_string(),
             });
@@ -208,7 +208,7 @@ pub fn scan_mft_children(
     )?;
     cancellation.check()?;
     progress(ScanProgress {
-        percentage: 86,
+        percentage: Some(0),
         phase: "mft-aggregate".to_string(),
         message: "正在汇总目录占用…".to_string(),
     });
@@ -256,7 +256,9 @@ pub fn scan_mft_children(
         if index % 4096 == 0 {
             cancellation.check()?;
             progress(ScanProgress {
-                percentage: 86 + u8::try_from(index.saturating_mul(9) / parent_count).unwrap_or(8),
+                percentage: Some(
+                    u8::try_from(index.saturating_mul(100) / parent_count).unwrap_or(99),
+                ),
                 phase: "mft-aggregate".to_string(),
                 message: "正在汇总目录占用…".to_string(),
             });
@@ -282,7 +284,7 @@ pub fn scan_mft_children(
 
     cancellation.check()?;
     progress(ScanProgress {
-        percentage: 100,
+        percentage: Some(100),
         phase: "complete".to_string(),
         message: "扫描完成".to_string(),
     });

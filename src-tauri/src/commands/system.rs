@@ -30,20 +30,24 @@ pub async fn get_bootstrap_data(state: State<'_, AppState>) -> AppResult<Bootstr
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let settings = state.storage().load_settings()?;
+        let drives = platform::fixed_ntfs_drives();
+        let automatic_root = storage_planner::automatic_managed_root_for(&drives);
         let mut links = state.storage().load_links()?;
         links.sort_by(|left, right| right.detected_at_utc.cmp(&left.detected_at_utc));
         Ok(BootstrapData {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            managed_locations: storage_planner::managed_locations(&settings),
-            drives: platform::fixed_ntfs_drives(),
+            managed_locations: storage_planner::managed_locations(
+                &settings,
+                automatic_root.as_deref(),
+            ),
+            drives,
             moves: migration::move_rows(state.storage())?,
             links,
             is_administrator: platform::is_administrator(),
             default_scan_root: storage_planner::default_scan_root(),
             scan_presets: storage_planner::scan_presets(),
             startup_scan_root: startup_scan_root(),
-            automatic_managed_root: storage_planner::automatic_managed_root()
-                .map(|path| path.to_string_lossy().into_owned()),
+            automatic_managed_root: automatic_root.map(|path| path.to_string_lossy().into_owned()),
             data_directory: state.storage().paths().root.to_string_lossy().into_owned(),
             settings: settings.into(),
         })
@@ -143,6 +147,13 @@ pub fn open_managed_root(state: State<'_, AppState>) -> AppResult<()> {
         .or_else(storage_planner::automatic_managed_root)
         .ok_or_else(|| AppError::InvalidInput("当前没有可用的其他固定 NTFS 分区。".to_string()))?;
     storage_planner::validate_managed_root(&root, None)?;
+    std::fs::create_dir_all(&root)?;
+    platform::open_in_file_manager(&root, false)
+}
+
+#[tauri::command]
+pub fn open_diagnostics(state: State<'_, AppState>) -> AppResult<()> {
+    let root = state.storage().paths().root.join("logs");
     std::fs::create_dir_all(&root)?;
     platform::open_in_file_manager(&root, false)
 }

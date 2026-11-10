@@ -1,15 +1,15 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowReactive, shallowRef, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import BaseButton from "@/components/base/BaseButton.vue";
 import BaseDialog from "@/components/base/BaseDialog.vue";
-import BaseProgress from "@/components/base/BaseProgress.vue";
+import TaskProgress from "@/components/business/TaskProgress.vue";
 import FolderTable from "@/components/business/FolderTable.vue";
 import MigrationDestinationDialog from "@/components/business/MigrationDestinationDialog.vue";
 import { api } from "@/services/api";
 import { createScanSessionCache } from "@/services/scanSessionCache";
 import { normalizeAppError } from "@/services/tauri";
-import { estimateMigrationQueue } from "@/utils/migrationEstimate";
+import { formatElapsedTime, mergeTaskState, taskElapsedMs } from "@/utils/taskState";
 import { sortFolderRows } from "@/utils/folderSort";
 import type {
   BootstrapData,
@@ -26,12 +26,11 @@ import { copyText, formatBytes, formatInteger } from "@/utils/format";
 type MigrationQueueEntry = {
   plan: MigrationPlan;
   task: TaskDescriptor;
-  estimatedBytes: number;
-  runningAtMs: number | null;
-  finishedAtMs: number | null;
 };
 
-const props = defineProps<{ bootstrap: BootstrapData }>();
+const props = withDefaults(defineProps<{ bootstrap: BootstrapData; dataRevision?: number }>(), {
+  dataRevision: 0,
+});
 const emit = defineEmits<{
   status: [message: string];
   busy: [busy: boolean];
@@ -42,17 +41,21 @@ const emit = defineEmits<{
 const root = ref(props.bootstrap.startupScanRoot ?? props.bootstrap.defaultScanRoot);
 const rows = shallowRef<FolderRow[]>([]);
 const selectedPaths = ref<string[]>([]);
+const selectedRowCache = shallowReactive(new Map<string, FolderRow>());
+const previewPage = ref(1);
+const loadingPage = ref(false);
+let listRequestId = 0;
+const pageSize = 500;
 const scanPage = shallowRef<ScanPage | null>(null);
 const scanTask = shallowRef<TaskDescriptor | null>(null);
 const migrationEntries = shallowRef<MigrationQueueEntry[]>([]);
 const pendingMigrationEvents = new Map<string, TaskEvent>();
-const migrationSizeBySource = new Map<string, number>();
 const migrationQueueCollapsed = ref(false);
-const estimateClock = ref(Date.now());
-let estimateTimer: number | null = null;
 const sortField = ref<SortField>("name");
 const sortDirection = ref<SortDirection>("ascending");
 const loadingPreview = ref(false);
+const startingScan = ref(false);
+const cancellingTasks = shallowReactive(new Set<string>());
 const planningMigration = ref(false);
 const submittingMigration = ref(false);
 const elevationOpen = ref(false);
@@ -65,29 +68,29 @@ const confirmMigrationOpen = ref(false);
 const scanCache = createScanSessionCache();
 
 const isScanBusy = computed(
-  () => loadingPreview.value || ["queued", "running"].includes(scanTask.value?.state ?? ""),
+  () => startingScan.value || loadingPreview.value || loadingPage.value || ["queued", "running"].includes(scanTask.value?.state ?? ""),
 );
-const selectedRows = computed(() => {
-  const paths = new Set(selectedPaths.value);
-  return rows.value.filter((row) => paths.has(row.fullPath));
-});
+const selectedRows = computed(() => selectedPaths.value
+  .map((path) => selectedRowCache.get(path))
+  .filter((row): row is FolderRow => row !== undefined));
 const activeMigrationCount = computed(
   () => migrationEntries.value.filter(({ task }) => ["queued", "running"].includes(task.state)).length,
 );
-const migrationEstimate = computed(() => estimateMigrationQueue(
-  migrationEntries.value.map((entry) => ({
-    id: entry.task.id,
-    state: entry.task.state,
-    percentage: entry.task.percentage,
-    bytes: entry.estimatedBytes,
-    runningAtMs: entry.runningAtMs,
-    finishedAtMs: entry.finishedAtMs,
-  })),
-  estimateClock.value,
-));
 const folderCount = computed(() => scanPage.value?.totalItems ?? rows.value.length);
+const currentPage = computed(() => scanPage.value?.page ?? previewPage.value);
+const pageCount = computed(() => Math.max(1, Math.ceil(folderCount.value / pageSize)));
+const visibleRows = computed(() => scanPage.value
+  ? rows.value
+  : rows.value.slice((previewPage.value - 1) * pageSize, previewPage.value * pageSize));
 const totalLogical = computed(() => scanPage.value ? formatBytes(scanPage.value.totalBytes) : "未扫描");
 const totalAllocated = computed(() => scanPage.value ? formatBytes(scanPage.value.totalAllocatedBytes) : "未扫描");
+watch(() => props.dataRevision, () => {
+  scanCache.clear();
+  scanPage.value = null;
+  previewPage.value = 1;
+  void loadPreview(true);
+});
+
 const currentPreset = computed(() => {
   const match = props.bootstrap.scanPresets.find(
     (preset) => preset.path.toLowerCase() === root.value.toLowerCase(),
@@ -96,15 +99,12 @@ const currentPreset = computed(() => {
 });
 
 onMounted(async () => {
-  estimateTimer = window.setInterval(() => {
-    estimateClock.value = Date.now();
-  }, 1_000);
   await loadPreview();
   if (props.bootstrap.startupScanRoot && props.bootstrap.isAdministrator) await startScan(false);
 });
 
 onBeforeUnmount(() => {
-  if (estimateTimer !== null) window.clearInterval(estimateTimer);
+  listRequestId += 1;
 });
 
 const chooseRoot = async (): Promise<void> => {
@@ -123,15 +123,26 @@ const changePreset = async (event: Event): Promise<void> => {
   await loadPreview();
 };
 
-const loadPreview = async (): Promise<void> => {
-  if (!root.value) return;
+const clearSelection = (): void => {
   selectedPaths.value = [];
-  const cached = scanCache.get(root.value);
+  selectedRowCache.clear();
+};
+
+const loadPreview = async (preserveSelection = false): Promise<void> => {
+  if (!root.value) return;
+  const requestId = ++listRequestId;
+  const requestedRoot = root.value;
+  loadingPage.value = false;
+  loadingPreview.value = false;
+  previewPage.value = 1;
+  if (!preserveSelection) clearSelection();
+  const cached = scanCache.get(requestedRoot);
   if (cached) {
     sortField.value = cached.sortField;
     sortDirection.value = cached.sortDirection;
     scanPage.value = cached.page;
     rows.value = cached.page.items;
+    emit("busy", false);
     emit("status", `已恢复扫描缓存（${cached.page.engine}）：${formatInteger(cached.page.totalItems)} 个文件夹`);
     return;
   }
@@ -140,18 +151,29 @@ const loadPreview = async (): Promise<void> => {
   emit("status", `正在列出 ${root.value} 的一级文件夹…`);
   scanPage.value = null;
   try {
+    const preview = await api.preview(requestedRoot);
+    if (requestId !== listRequestId) return;
     rows.value = sortFolderRows(
-      await api.preview(root.value),
+      preview,
       sortField.value,
       sortDirection.value,
     );
+    if (preserveSelection) {
+      const fresh = new Map(preview.filter((row) => !row.isLink).map((row) => [row.fullPath, row]));
+      selectedPaths.value = selectedPaths.value.filter((path) => fresh.has(path));
+      selectedRowCache.clear();
+      for (const path of selectedPaths.value) selectedRowCache.set(path, fresh.get(path)!);
+    }
     emit("status", `已列出 ${formatInteger(rows.value.length)} 个一级文件夹`);
   } catch (error: unknown) {
+    if (requestId !== listRequestId) return;
     notifyError(error);
     rows.value = [];
   } finally {
-    loadingPreview.value = false;
-    emit("busy", false);
+    if (requestId === listRequestId) {
+      loadingPreview.value = false;
+      emit("busy", scanTask.value?.state === "running");
+    }
   }
 };
 
@@ -164,18 +186,22 @@ const requestScan = async (force: boolean): Promise<void> => {
 };
 
 const startScan = async (force: boolean): Promise<void> => {
+  if (isScanBusy.value) return;
+  startingScan.value = true;
   emit("busy", true);
   emit("status", "正在准备扫描…");
   try {
     scanTask.value = await api.startScan(root.value, force, onScanEvent);
   } catch (error: unknown) {
-    emit("busy", false);
     notifyError(error);
+  } finally {
+    startingScan.value = false;
+    emit("busy", isScanBusy.value);
   }
 };
 
 const onScanEvent = (event: TaskEvent): void => {
-  scanTask.value = event.task;
+  scanTask.value = mergeTaskState(scanTask.value ?? undefined, event.task);
   emit("status", event.task.message);
   if (event.type === "progress") return;
   emit("busy", false);
@@ -188,46 +214,79 @@ const onScanEvent = (event: TaskEvent): void => {
   }
 };
 
-const loadScanPage = async (resultId: string): Promise<void> => {
+const loadScanPage = async (resultId: string, requestedPage = 1): Promise<void> => {
+  const requestId = ++listRequestId;
+  const requestedSort = sortField.value;
+  const requestedDirection = sortDirection.value;
+  loadingPreview.value = false;
+  loadingPage.value = true;
   try {
     const page = await api.scanPage(resultId, {
-      page: 1,
-      pageSize: 500,
-      sortField: sortField.value,
-      sortDirection: sortDirection.value,
+      page: requestedPage,
+      pageSize,
+      sortField: requestedSort,
+      sortDirection: requestedDirection,
     });
+    if (requestId !== listRequestId) return;
+    if (scanPage.value?.resultId !== resultId) clearSelection();
     scanPage.value = page;
     rows.value = page.items;
-    selectedPaths.value = [];
-    scanCache.set(page.root, { page, sortField: sortField.value, sortDirection: sortDirection.value });
+    const selected = new Set(selectedPaths.value);
+    for (const row of page.items) {
+      if (selected.has(row.fullPath)) selectedRowCache.set(row.fullPath, row);
+    }
+    scanCache.set(page.root, { page, sortField: requestedSort, sortDirection: requestedDirection });
     emit("status", `扫描完成（${page.engine}）：${formatInteger(page.totalItems)} 个文件夹`);
   } catch (error: unknown) {
-    notifyError(error);
+    if (requestId === listRequestId) notifyError(error);
+  } finally {
+    if (requestId === listRequestId) loadingPage.value = false;
   }
 };
 
+const changePage = async (page: number): Promise<void> => {
+  if (isScanBusy.value) return;
+  const target = Math.max(1, Math.min(pageCount.value, page));
+  if (scanPage.value) await loadScanPage(scanPage.value.resultId, target);
+  else previewPage.value = target;
+};
+
 const cancelScan = async (): Promise<void> => {
-  if (!scanTask.value) return;
+  if (!scanTask.value?.canCancel || cancellingTasks.has(scanTask.value.id)) return;
+  const id = scanTask.value.id;
+  cancellingTasks.add(id);
   try {
-    await api.cancelTask(scanTask.value.id);
-    emit("status", "正在安全停止扫描…");
+    const result = await api.cancelTask(id);
+    if (scanTask.value?.id === id) scanTask.value = mergeTaskState(scanTask.value, result);
+    emit("status", scanTask.value?.message ?? result.message);
   } catch (error: unknown) {
     notifyError(error);
+  } finally {
+    cancellingTasks.delete(id);
   }
 };
 
 const toggleSelection = (row: FolderRow): void => {
-  selectedPaths.value = selectedPaths.value.includes(row.fullPath)
-    ? selectedPaths.value.filter((path) => path !== row.fullPath)
-    : [...selectedPaths.value, row.fullPath];
+  if (selectedPaths.value.includes(row.fullPath)) {
+    selectedRowCache.delete(row.fullPath);
+    selectedPaths.value = selectedPaths.value.filter((path) => path !== row.fullPath);
+  } else {
+    selectedRowCache.set(row.fullPath, row);
+    selectedPaths.value = [...selectedPaths.value, row.fullPath];
+  }
 };
 
 const toggleAllVisible = (): void => {
-  const visible = rows.value.map((row) => row.fullPath);
+  const visible = visibleRows.value.map((row) => row.fullPath);
   const selected = new Set(selectedPaths.value);
   const allSelected = visible.length > 0 && visible.every((path) => selected.has(path));
+  for (const row of visibleRows.value) {
+    if (allSelected) selectedRowCache.delete(row.fullPath);
+    else selectedRowCache.set(row.fullPath, row);
+  }
+  const visiblePaths = new Set(visible);
   selectedPaths.value = allSelected
-    ? selectedPaths.value.filter((path) => !visible.includes(path))
+    ? selectedPaths.value.filter((path) => !visiblePaths.has(path))
     : [...new Set([...selectedPaths.value, ...visible])];
 };
 
@@ -239,7 +298,10 @@ const changeSort = async (field: SortField): Promise<void> => {
     sortDirection.value = field === "name" ? "ascending" : "descending";
   }
   if (scanPage.value) await loadScanPage(scanPage.value.resultId);
-  else rows.value = sortFolderRows(rows.value, sortField.value, sortDirection.value);
+  else {
+    rows.value = sortFolderRows(rows.value, sortField.value, sortDirection.value);
+    previewPage.value = 1;
+  }
 };
 
 const openFolder = async (row: FolderRow): Promise<void> => {
@@ -278,9 +340,6 @@ const prepareMigration = async (): Promise<void> => {
   }
   planningMigration.value = true;
   try {
-    for (const row of selected) {
-      migrationSizeBySource.set(row.fullPath, row.allocatedBytes || row.bytes);
-    }
     managedPlans.value = await Promise.all(selected.map((row) => api.planMigration(row.fullPath, null)));
     customPlans.value = [];
     migrationMode.value = managedPlans.value.every((plan) => plan.available) ? "managed" : "custom";
@@ -327,9 +386,6 @@ const executeMigration = async (): Promise<void> => {
       ...tasks.map((task, index) => ({
         plan: plans[index],
         task,
-        estimatedBytes: migrationSizeBySource.get(plans[index].source) ?? 0,
-        runningAtMs: task.state === "running" ? Date.now() : null,
-        finishedAtMs: null,
       })),
     ];
     for (const task of tasks) {
@@ -342,6 +398,7 @@ const executeMigration = async (): Promise<void> => {
     selectedPaths.value = selectedPaths.value.filter(
       (path) => !plans.some((plan) => plan.source === path),
     );
+    for (const plan of plans) selectedRowCache.delete(plan.source);
     migrationOpen.value = false;
     confirmMigrationOpen.value = false;
     emit("status", `${tasks.length} 个迁移任务已加入后台队列。`);
@@ -361,37 +418,17 @@ const onMigrationEvent = (event: TaskEvent): void => {
   }
   const entry = migrationEntries.value[index];
   const updated = [...migrationEntries.value];
-  const now = Date.now();
-  updated[index] = {
-    ...entry,
-    task: event.task,
-    runningAtMs:
-      entry.runningAtMs ?? (event.task.state === "running" ? now : null),
-    finishedAtMs:
-      ["completed", "failed", "cancelled"].includes(event.task.state)
-        ? (entry.finishedAtMs ?? now)
-        : entry.finishedAtMs,
-  };
+  updated[index] = { ...entry, task: mergeTaskState(entry.task, event.task) };
   migrationEntries.value = updated;
   emit("status", event.task.message);
   if (event.type === "progress") return;
+  if (event.task.runningAtUtc !== null) emit("refreshData");
   if (event.type === "completed") {
     scanCache.clear();
-    const movedRow = rows.value.find((row) => row.fullPath === entry.plan.source);
     rows.value = rows.value.filter((row) => row.fullPath !== entry.plan.source);
     selectedPaths.value = selectedPaths.value.filter((path) => path !== entry.plan.source);
-    if (scanPage.value && movedRow) {
-      scanPage.value = {
-        ...scanPage.value,
-        items: rows.value,
-        totalItems: Math.max(0, scanPage.value.totalItems - 1),
-        totalBytes: Math.max(0, scanPage.value.totalBytes - movedRow.bytes),
-        totalAllocatedBytes: Math.max(0, scanPage.value.totalAllocatedBytes - movedRow.allocatedBytes),
-        totalFiles: Math.max(0, scanPage.value.totalFiles - movedRow.fileCount),
-      };
-    }
+    selectedRowCache.delete(entry.plan.source);
     emit("notify", event.summary, "success");
-    emit("refreshData");
   } else if (event.type === "failed") {
     emit("notify", event.message, "error");
   } else {
@@ -400,6 +437,8 @@ const onMigrationEvent = (event: TaskEvent): void => {
 };
 
 const cancelMigration = async (task: TaskDescriptor): Promise<void> => {
+  if (!task.canCancel || cancellingTasks.has(task.id)) return;
+  cancellingTasks.add(task.id);
   try {
     const cancelled = await api.cancelTask(task.id);
     const index = migrationEntries.value.findIndex(
@@ -407,19 +446,14 @@ const cancelMigration = async (task: TaskDescriptor): Promise<void> => {
     );
     if (index >= 0) {
       const updated = [...migrationEntries.value];
-      updated[index] = {
-        ...updated[index],
-        task: cancelled,
-        finishedAtMs:
-          cancelled.state === "cancelled"
-            ? (updated[index].finishedAtMs ?? Date.now())
-            : updated[index].finishedAtMs,
-      };
+      updated[index] = { ...updated[index], task: mergeTaskState(updated[index].task, cancelled) };
       migrationEntries.value = updated;
     }
-    emit("status", task.state === "queued" ? "排队任务将在轮到时跳过。" : "正在安全停止迁移…");
+    emit("status", index >= 0 ? migrationEntries.value[index].task.message : cancelled.message);
   } catch (error: unknown) {
     notifyError(error);
+  } finally {
+    cancellingTasks.delete(task.id);
   }
 };
 
@@ -431,45 +465,18 @@ const taskStateLabel = (task: TaskDescriptor): string => ({
   cancelled: "已取消",
 })[task.state];
 
-const formatEstimateDuration = (milliseconds: number): string => {
-  const seconds = Math.max(1, Math.ceil(milliseconds / 1_000));
-  if (seconds < 60) return `${seconds} 秒`;
-  const minutes = Math.ceil(seconds / 60);
-  if (minutes < 60) return `${minutes} 分钟`;
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  return remainingMinutes > 0 ? `${hours} 小时 ${remainingMinutes} 分钟` : `${hours} 小时`;
-};
-
-const entryEstimateLabel = (entry: MigrationQueueEntry): string => {
-  const estimate = migrationEstimate.value.entries[entry.task.id];
-  if (!estimate) return "正在估算";
-  if (entry.task.state === "running") {
-    return estimate.remainingMs === null
-      ? "正在采样速度"
-      : `剩余约 ${formatEstimateDuration(estimate.remainingMs)}`;
-  }
-  if (entry.task.state === "queued") {
-    if (estimate.waitMs === null) return "等待速度样本";
-    const starts = estimate.waitMs < 1_000
-      ? "即将开始"
-      : `约 ${formatEstimateDuration(estimate.waitMs)}后开始`;
-    return estimate.durationMs === null
-      ? starts
-      : `${starts} · 用时约 ${formatEstimateDuration(estimate.durationMs)}`;
-  }
-  if (entry.task.state === "completed" && estimate.elapsedMs !== null) {
-    return `用时 ${formatEstimateDuration(estimate.elapsedMs)}`;
-  }
+const entryTimeLabel = (entry: MigrationQueueEntry): string => {
+  if (entry.task.state === "queued") return "等待前方任务完成";
+  const elapsed = taskElapsedMs(entry.task);
+  if (entry.task.state === "completed" && elapsed !== null) return `用时 ${formatElapsedTime(elapsed)}`;
   return entry.task.message;
 };
 
-const queueEstimateLabel = computed(() => {
-  if (activeMigrationCount.value === 0) return "队列已完成";
-  const remaining = migrationEstimate.value.totalRemainingMs;
-  return remaining === null
-    ? "用时正在估算"
-    : `预计剩余 ${formatEstimateDuration(remaining)}`;
+const queueSummaryLabel = computed(() => {
+  const completed = migrationEntries.value.filter(({ task }) => task.state === "completed").length;
+  const failed = migrationEntries.value.filter(({ task }) => task.state === "failed").length;
+  const cancelled = migrationEntries.value.filter(({ task }) => task.state === "cancelled").length;
+  return `${completed} 项完成 · ${failed} 项失败 · ${cancelled} 项取消`;
 });
 
 const elevate = async (): Promise<void> => {
@@ -541,9 +548,10 @@ const notifyError = (error: unknown): void => {
       </BaseButton>
       <BaseButton
         v-if="scanTask?.state === 'running'"
+        :disabled="!scanTask.canCancel || cancellingTasks.has(scanTask.id)"
         @click="cancelScan"
       >
-        停止
+        {{ scanTask.cancelRequested ? "正在停止" : "停止" }}
       </BaseButton>
       <BaseButton
         variant="primary"
@@ -557,11 +565,7 @@ const notifyError = (error: unknown): void => {
 
     <div class="activity-stack">
       <div v-if="scanTask?.state === 'running'" class="task-progress">
-        <div>
-          <span>{{ scanTask.message }}</span>
-          <strong>{{ scanTask.percentage }}%</strong>
-        </div>
-        <BaseProgress :value="scanTask.percentage" />
+        <TaskProgress :task="scanTask" />
       </div>
 
       <section
@@ -579,8 +583,8 @@ const notifyError = (error: unknown): void => {
             <span class="queue-chevron" :class="{ collapsed: migrationQueueCollapsed }" />
             <strong>后台迁移队列</strong>
           </button>
-          <span class="queue-summary" title="预估会根据实际迁移速度动态更新">
-            {{ activeMigrationCount }} 项进行中或等待中 · {{ queueEstimateLabel }}
+          <span class="queue-summary" title="任务按队列顺序执行">
+            {{ activeMigrationCount }} 项进行中或等待中 · {{ queueSummaryLabel }}
           </span>
         </header>
         <div v-show="!migrationQueueCollapsed" class="queue-list">
@@ -590,18 +594,19 @@ const notifyError = (error: unknown): void => {
               <span :title="entry.plan.destination ?? ''">→ {{ entry.plan.destination }}</span>
             </div>
             <div class="queue-state" :class="entry.task.state">
-              <div>
-                <span>{{ taskStateLabel(entry.task) }}</span>
-                <strong v-if="entry.task.state === 'running'">{{ entry.task.percentage }}%</strong>
-              </div>
-              <small>{{ entryEstimateLabel(entry) }}</small>
+              <TaskProgress v-if="entry.task.state === 'running'" :task="entry.task" />
+              <template v-else>
+                <div><span>{{ taskStateLabel(entry.task) }}</span></div>
+                <small>{{ entryTimeLabel(entry) }}</small>
+              </template>
             </div>
             <BaseButton
               v-if="entry.task.state === 'queued' || entry.task.state === 'running'"
+              :disabled="!entry.task.canCancel || cancellingTasks.has(entry.task.id)"
               size="small"
               @click="cancelMigration(entry.task)"
             >
-              取消
+              {{ entry.task.canCancel ? "取消" : entry.task.cancelRequested ? "正在停止" : "安全收尾中" }}
             </BaseButton>
           </article>
         </div>
@@ -630,10 +635,10 @@ const notifyError = (error: unknown): void => {
     <section class="content-panel">
       <header>
         <strong>目录明细</strong>
-        <span v-if="loadingPreview">正在读取…</span>
+        <span v-if="loadingPreview || loadingPage">正在读取…</span>
       </header>
       <FolderTable
-        :rows="rows"
+        :rows="visibleRows"
         :selected-paths="selectedPaths"
         :sort-field="sortField"
         :sort-direction="sortDirection"
@@ -644,6 +649,15 @@ const notifyError = (error: unknown): void => {
         @open="openFolder"
         @copy="copyFolder"
       />
+      <nav v-if="pageCount > 1" class="folder-pagination" aria-label="目录分页">
+        <span>第 {{ currentPage }} / {{ pageCount }} 页 · 共 {{ formatInteger(folderCount) }} 项</span>
+        <div>
+          <BaseButton size="small" :disabled="isScanBusy || currentPage === 1" @click="changePage(1)">首页</BaseButton>
+          <BaseButton size="small" :disabled="isScanBusy || currentPage === 1" @click="changePage(currentPage - 1)">上一页</BaseButton>
+          <BaseButton size="small" :disabled="isScanBusy || currentPage === pageCount" @click="changePage(currentPage + 1)">下一页</BaseButton>
+          <BaseButton size="small" :disabled="isScanBusy || currentPage === pageCount" @click="changePage(pageCount)">末页</BaseButton>
+        </div>
+      </nav>
     </section>
   </section>
 
@@ -702,6 +716,22 @@ const notifyError = (error: unknown): void => {
 </template>
 
 <style scoped>
+.folder-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: var(--font-size-small);
+}
+
+.folder-pagination > div {
+  display: flex;
+  gap: var(--space-2);
+}
 .view {
   display: grid;
   height: 100%;

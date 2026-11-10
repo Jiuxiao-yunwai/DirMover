@@ -6,6 +6,8 @@ mod services;
 mod state;
 mod storage;
 mod tasks;
+#[cfg(test)]
+mod test_support;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -20,6 +22,7 @@ pub fn run() {
             commands::system::plan_migration,
             commands::system::open_path,
             commands::system::open_managed_root,
+            commands::system::open_diagnostics,
             commands::system::request_elevation,
             commands::scan::list_child_folders,
             commands::scan::start_scan,

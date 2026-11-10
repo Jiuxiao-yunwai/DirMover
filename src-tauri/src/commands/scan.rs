@@ -1,18 +1,16 @@
 use crate::{
     error::{AppError, AppResult},
     models::{
-        FolderRow, LinkRow, ScanPage, ScanProgress, ScanQuery, SortDirection, SortField,
-        TaskDescriptor, TaskEvent, TaskKind,
+        FolderRow, LinkRow, ScanPage, ScanProgress, ScanQuery, TaskDescriptor, TaskEvent, TaskKind,
     },
     services::scanner,
     state::AppState,
-    tasks::CancellationFlag,
+    tasks::{CancellationFlag, ProgressThrottle},
 };
 use std::{
-    cmp::Ordering,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tauri::{State, ipc::Channel};
 use uuid::Uuid;
@@ -38,10 +36,11 @@ pub fn start_scan(
         let (task, _) = state
             .tasks()
             .start(TaskKind::Scan, "cache", "正在读取扫描缓存…")?;
-        let completed =
-            state
-                .tasks()
-                .complete(task.id, Some(snapshot.id), "已加载本次运行的扫描缓存。")?;
+        let completed = state.tasks().complete(
+            task.id,
+            Some(snapshot.snapshot.id),
+            "已加载本次运行的扫描缓存。",
+        )?;
         let _ = on_event.send(TaskEvent::Completed {
             task: completed.clone(),
             summary: "已加载本次运行的扫描缓存。".to_string(),
@@ -49,33 +48,21 @@ pub fn start_scan(
         return Ok(completed);
     }
 
+    let generation = state.scan_generation()?;
     let (task, cancellation) = state
         .tasks()
         .start(TaskKind::Scan, "prepare", "正在准备扫描…")?;
     let task_id = task.id;
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let last_emitted = Arc::new(Mutex::new((
-            u8::MAX,
-            Instant::now() - Duration::from_secs(1),
-        )));
+        let last_emitted = Arc::new(Mutex::new(ProgressThrottle::default()));
         let event_state = state.clone();
         let event_channel = on_event.clone();
         let event_throttle = last_emitted.clone();
         let progress = move |update: ScanProgress| {
             let should_emit = event_throttle
                 .lock()
-                .map(|mut last| {
-                    let now = Instant::now();
-                    let changed = last.0 != update.percentage;
-                    let elapsed = now.duration_since(last.1) >= Duration::from_millis(80);
-                    if changed && elapsed {
-                        *last = (update.percentage, now);
-                        true
-                    } else {
-                        false
-                    }
-                })
+                .map(|mut last| last.allows(&update, Instant::now()))
                 .unwrap_or(false);
             if should_emit
                 && let Ok(task) = event_state.tasks().update(
@@ -97,10 +84,7 @@ pub fn start_scan(
                     snapshot.folders.len()
                 );
                 let result_id = snapshot.id;
-                let store_result = state
-                    .storage()
-                    .replace_links_for_root(Path::new(&root), &snapshot.links)
-                    .and_then(|()| state.insert_scan(snapshot));
+                let store_result = state.publish_scan(snapshot, generation);
                 match store_result {
                     Ok(_) => {
                         if let Ok(task) = state.tasks().complete(task_id, Some(result_id), &summary)
@@ -133,46 +117,15 @@ pub fn get_task(task_id: Uuid, state: State<'_, AppState>) -> AppResult<TaskDesc
 }
 
 #[tauri::command]
-pub fn query_scan_result(
+pub async fn query_scan_result(
     result_id: Uuid,
     query: ScanQuery,
     state: State<'_, AppState>,
 ) -> AppResult<ScanPage> {
     let snapshot = state.scan(result_id)?;
-    let page_size = query.page_size.clamp(20, 500);
-    let page = query.page.max(1);
-    let mut items = snapshot.folders.clone();
-    items.sort_by(|left, right| compare_folders(left, right, query.sort_field));
-    if matches!(query.sort_direction, SortDirection::Descending) {
-        items.reverse();
-    }
-    let total_items = items.len();
-    let start = page.saturating_sub(1).saturating_mul(page_size);
-    let visible = if start >= total_items {
-        Vec::new()
-    } else {
-        items
-            .into_iter()
-            .skip(start)
-            .take(page_size)
-            .collect::<Vec<_>>()
-    };
-    let total_bytes = snapshot.total_bytes();
-    let total_allocated_bytes = snapshot.total_allocated_bytes();
-    let total_files = snapshot.total_files();
-    Ok(ScanPage {
-        result_id,
-        root: snapshot.root,
-        engine: snapshot.engine,
-        created_at_utc: snapshot.created_at_utc,
-        items: visible,
-        total_items,
-        page,
-        page_size,
-        total_bytes,
-        total_allocated_bytes,
-        total_files,
-    })
+    tauri::async_runtime::spawn_blocking(move || snapshot.page(query))
+        .await
+        .map_err(|error| AppError::Task(format!("扫描结果查询异常结束：{error}")))?
 }
 
 #[tauri::command]
@@ -187,16 +140,6 @@ pub async fn detect_links(root: String, state: State<'_, AppState>) -> AppResult
     })
     .await
     .map_err(|error| AppError::Task(format!("链接检测任务异常结束：{error}")))?
-}
-
-fn compare_folders(left: &FolderRow, right: &FolderRow, field: SortField) -> Ordering {
-    match field {
-        SortField::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-        SortField::Bytes => left.bytes.cmp(&right.bytes),
-        SortField::AllocatedBytes => left.allocated_bytes.cmp(&right.allocated_bytes),
-        SortField::FileCount => left.file_count.cmp(&right.file_count),
-        SortField::Status => left.note.cmp(&right.note),
-    }
 }
 
 fn emit_failure(state: &AppState, task_id: Uuid, channel: &Channel<TaskEvent>, error: AppError) {

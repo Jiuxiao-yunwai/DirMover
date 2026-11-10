@@ -26,11 +26,14 @@ pub struct TaskDescriptor {
     pub id: Uuid,
     pub kind: TaskKind,
     pub state: TaskState,
-    pub percentage: u8,
+    pub can_cancel: bool,
+    pub cancel_requested: bool,
+    pub percentage: Option<u8>,
     pub phase: String,
     pub message: String,
     pub result_id: Option<Uuid>,
     pub started_at_utc: DateTime<Utc>,
+    pub running_at_utc: Option<DateTime<Utc>>,
     pub finished_at_utc: Option<DateTime<Utc>>,
 }
 

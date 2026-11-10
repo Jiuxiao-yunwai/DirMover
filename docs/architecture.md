@@ -80,4 +80,4 @@ Active -> restore copy -> verify -> switch -> cleanup -> removed/Restored
 
 - Rust：格式检查、Clippy `-D warnings`、单元测试。
 - Web：Vue 类型检查、ESLint、Vitest、Vite 生产构建。
-- Desktop：Tauri release 构建，并生成 NSIS/MSI 安装包。
+- Desktop：Tauri release 构建，并生成 Windows x64 中文 MSI 安装包。

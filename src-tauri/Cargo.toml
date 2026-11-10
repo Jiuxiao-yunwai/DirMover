@@ -1,6 +1,6 @@
 [package]
 name = "dirmover"
-version = "2.2.2-dev.5"
+version = "2.2.2"
 description = "A safe, fast Windows directory migration tool"
 authors = ["DirMover contributors"]
 edition = "2024"

@@ -8,7 +8,12 @@ DirMover 是一个轻量、高性能的 Windows 目录空间分析与安全迁�
 
 前往 [Releases](https://github.com/Jiuxiao-yunwai/DirMover/releases/latest) 下载最新版本。当前仅提供 Windows x64 版本，建议使用 Windows 10 或 Windows 11。
 
-从 2.2.2 起统一提供 MSI 安装包：`DirMover_*_x64_zh-CN.msi`。默认安装到 `C:\Program Files\DirMover`，安装时需要管理员权限。
+从 2.2.2 起提供 MSI 安装包和便携版，应用功能相同：
+
+| 下载文件 | 使用方式 |
+| --- | --- |
+| `DirMover_*_x64_zh-CN.msi` | 安装版，默认安装到 `C:\Program Files\DirMover`，安装时需要管理员权限 |
+| `DirMover_*_portable.exe` | 便携版，无需安装，下载后直接运行 |
 
 安装步骤：
 
@@ -16,6 +21,8 @@ DirMover 是一个轻量、高性能的 Windows 目录空间分析与安全迁�
 2. 退出正在运行的旧版 DirMover。
 3. 双击安装包并按照中文向导完成安装。
 4. 已安装 MSI 版时，可使用新版 MSI 覆盖升级。若旧版使用 EXE 安装包，请先卸载旧版，再安装 MSI。
+
+便携版升级时，退出旧程序后用新版 `portable.exe` 替换即可。便携版同样需要系统已安装 Microsoft Edge WebView2 Runtime。
 
 迁移记录保存在 `%USERPROFILE%\.dirmover`，更换安装包格式无需还原已经迁移的目录。
 

@@ -29,6 +29,10 @@ $releaseFiles = @(
         Source = Join-Path $buildRoot "release\bundle\msi\DirMover_${version}_x64_zh-CN.msi"
         Name = "DirMover_${version}_x64_zh-CN.msi"
     }
+    @{
+        Source = Join-Path $buildRoot "release\dirmover.exe"
+        Name = "DirMover_${version}_portable.exe"
+    }
 )
 
 foreach ($file in $releaseFiles) {
